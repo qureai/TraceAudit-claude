@@ -14,9 +14,13 @@ PROMPTS_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 PROCESSED_DIR.mkdir(exist_ok=True)
 
-# Sampling settings for test run
+# Sampling settings
 TEST_SAMPLE_SIZE = 1000
 FULL_SAMPLE_SIZE = 50000
+
+# Active sample size - change this to control how many traces to process
+# Set to TEST_SAMPLE_SIZE for quick testing, FULL_SAMPLE_SIZE for production
+SAMPLE_SIZE = FULL_SAMPLE_SIZE
 
 # Server config
 HOST = "127.0.0.1"

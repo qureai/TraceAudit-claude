@@ -1,5 +1,7 @@
 import json
 import sqlite3
+import logging
+import time
 from datetime import datetime
 from collections import Counter
 from dataclasses import dataclass, asdict
@@ -7,6 +9,8 @@ from typing import Optional
 from pathlib import Path
 
 from config import TRACES_DB, PROMPTS_DIR, ANALYSIS_CACHE
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -35,12 +39,16 @@ def get_db_connection():
 
 def run_analysis() -> AnalysisResult:
     """Run comprehensive analysis on processed traces."""
+    start_time = time.time()
+    logger.debug("Starting analysis...")
+
     conn = get_db_connection()
     cursor = conn.cursor()
 
     # Total elements (rows)
     cursor.execute('SELECT COUNT(*) FROM traces')
     total_elements = cursor.fetchone()[0]
+    logger.debug(f"Total elements in database: {total_elements:,}")
 
     # Unique trace IDs
     cursor.execute('SELECT COUNT(DISTINCT trace_id) FROM traces')
@@ -276,6 +284,9 @@ def run_analysis() -> AnalysisResult:
     # Cache the result
     with open(ANALYSIS_CACHE, 'w') as f:
         json.dump(asdict(result), f, indent=2)
+
+    elapsed = time.time() - start_time
+    logger.debug(f"Analysis completed in {elapsed:.3f}s")
 
     return result
 

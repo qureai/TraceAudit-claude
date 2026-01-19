@@ -1,9 +1,16 @@
 from fasthtml.common import *
 import logging
 import json
+import subprocess
+import argparse
 from pathlib import Path
 
-from config import HOST, PORT, PROMPTS_DIR
+from config import HOST, PORT, PROMPTS_DIR, SAMPLE_SIZE
+
+# Global config that can be set via CLI args
+app_config = {
+    'sample_size': SAMPLE_SIZE
+}
 from analyzer import (
     run_analysis, get_random_traces_for_use_case, get_trace_detail,
     get_system_prompt_content, get_traces_with_errors, get_model_stats_by_use_case,
@@ -194,6 +201,73 @@ app, rt = fast_app(
 )
 
 
+@rt('/reprocess')
+def post():
+    """Rerun the data processor to reprocess all traces"""
+    import time as time_module
+    start_time = time_module.time()
+
+    sample_size = app_config['sample_size']
+
+    logger.info("=" * 60)
+    logger.info("REPROCESS REQUEST RECEIVED")
+    logger.info("=" * 60)
+    logger.info(f"Sample size: {sample_size:,}")
+    logger.info("Launching data processor subprocess...")
+
+    try:
+        result = subprocess.run(
+            ['python', 'data_processor.py', '--size', str(sample_size)],
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).parent)
+        )
+
+        elapsed = time_module.time() - start_time
+
+        # Log stdout (the processing output)
+        if result.stdout:
+            logger.info("-" * 40)
+            logger.info("DATA PROCESSOR OUTPUT:")
+            for line in result.stdout.strip().split('\n'):
+                logger.info(f"  {line}")
+
+        # Log stderr (usually contains the detailed logging)
+        if result.stderr:
+            logger.info("-" * 40)
+            logger.info("DATA PROCESSOR LOGS:")
+            for line in result.stderr.strip().split('\n')[-20:]:  # Last 20 lines
+                logger.info(f"  {line}")
+
+        if result.returncode == 0:
+            logger.info("-" * 40)
+            logger.info(f"REPROCESS COMPLETED SUCCESSFULLY in {elapsed:.2f}s")
+            logger.info("=" * 60)
+            # Return a redirect response
+            return RedirectResponse('/', status_code=303)
+        else:
+            logger.error("-" * 40)
+            logger.error(f"REPROCESS FAILED (exit code: {result.returncode})")
+            logger.error(f"Error output: {result.stderr[-500:] if result.stderr else 'No error output'}")
+            logger.error("=" * 60)
+            return Div(
+                H3("Reprocess Failed", style="color: #ef4444; margin-bottom: 16px;"),
+                Pre(result.stderr or "Unknown error", style="background: #1f2940; padding: 16px; border-radius: 8px; color: #f87171; max-height: 400px; overflow-y: auto;"),
+                A("Back to Dashboard", href="/", style="display: inline-block; margin-top: 16px; padding: 12px 24px; background: #3b82f6; color: white; border-radius: 8px; text-decoration: none;"),
+                style="padding: 24px;"
+            )
+    except Exception as e:
+        logger.error("=" * 60)
+        logger.error(f"REPROCESS EXCEPTION: {str(e)}")
+        logger.error("=" * 60)
+        return Div(
+            H3("Reprocess Error", style="color: #ef4444; margin-bottom: 16px;"),
+            P(f"Exception: {str(e)}", style="color: #f87171;"),
+            A("Back to Dashboard", href="/", style="display: inline-block; margin-top: 16px; padding: 12px 24px; background: #3b82f6; color: white; border-radius: 8px; text-decoration: none;"),
+            style="padding: 24px;"
+        )
+
+
 @rt('/')
 def get():
     logger.info("Loading dashboard")
@@ -214,9 +288,23 @@ def get():
         NavBar("dashboard"),
         Div(
             Div(
-                H2("📊 TraceAudit Dashboard", style="margin: 0;"),
-                P(f"Analyzing {analysis.total_elements:,} elements ({analysis.unique_trace_ids:,} unique traces) from {analysis.time_period_start[:10] if analysis.time_period_start != 'Unknown' else 'Unknown'} to {analysis.time_period_end[:10] if analysis.time_period_end != 'Unknown' else 'Unknown'}",
-                  style="margin: 4px 0 0 0; color: #94a3b8;"),
+                Div(
+                    Div(
+                        H2("📊 TraceAudit Dashboard", style="margin: 0;"),
+                        P(f"Analyzing {analysis.total_elements:,} elements ({analysis.unique_trace_ids:,} unique traces) from {analysis.time_period_start[:10] if analysis.time_period_start != 'Unknown' else 'Unknown'} to {analysis.time_period_end[:10] if analysis.time_period_end != 'Unknown' else 'Unknown'}",
+                          style="margin: 4px 0 0 0; color: #94a3b8;"),
+                    ),
+                    Form(
+                        Button(
+                            "🔄 Rerun Process",
+                            type="submit",
+                            style="padding: 10px 20px; background: #8b5cf6; color: white; border: none; border-radius: 8px; font-weight: 500; cursor: pointer;"
+                        ),
+                        action="/reprocess",
+                        method="post"
+                    ),
+                    style="display: flex; justify-content: space-between; align-items: flex-start;"
+                ),
                 cls="section-header"
             ),
             # Top stats
@@ -698,5 +786,22 @@ def get():
 
 
 if __name__ == "__main__":
-    logger.info(f"Starting TraceAudit server on {HOST}:{PORT}")
-    serve(host=HOST, port=PORT)
+    parser = argparse.ArgumentParser(description="TraceAudit - LLM Trace Analysis Dashboard")
+    parser.add_argument("--port", type=int, default=PORT, help=f"Port to run the server on (default: {PORT})")
+    parser.add_argument("--host", type=str, default=HOST, help=f"Host to bind the server to (default: {HOST})")
+    parser.add_argument("--size", type=int, default=SAMPLE_SIZE, help=f"Sample size for processing (default: {SAMPLE_SIZE} from config.py)")
+    args = parser.parse_args()
+
+    # Update global config with CLI args
+    app_config['sample_size'] = args.size
+
+    logger.info("=" * 60)
+    logger.info("TRACEAUDIT SERVER STARTING")
+    logger.info("=" * 60)
+    logger.info(f"Host: {args.host}")
+    logger.info(f"Port: {args.port}")
+    logger.info(f"Sample size: {args.size:,}")
+    logger.info(f"URL: http://{args.host}:{args.port}")
+    logger.info("=" * 60)
+
+    serve(host=args.host, port=args.port)

@@ -1,6 +1,8 @@
 import json
 import hashlib
 import logging
+import time
+import os
 from pathlib import Path
 from datetime import datetime
 from collections import Counter
@@ -12,6 +14,15 @@ from config import JSONL_FILE, PROMPTS_DIR, PROCESSED_DIR, TRACES_DB
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def format_file_size(size_bytes: int) -> str:
+    """Format file size in human readable format."""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size_bytes < 1024:
+            return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.2f} TB"
 
 
 @dataclass
@@ -235,10 +246,18 @@ def process_trace(trace: dict) -> Optional[TraceInfo]:
 
 def init_database():
     """Initialize SQLite database for storing processed traces."""
+    logger.info(f"Initializing database at {TRACES_DB}")
+
+    # Check if database exists and get its size
+    if os.path.exists(TRACES_DB):
+        old_size = os.path.getsize(TRACES_DB)
+        logger.info(f"Existing database found ({format_file_size(old_size)}), will be recreated")
+
     conn = sqlite3.connect(TRACES_DB)
     cursor = conn.cursor()
 
     # Drop old tables to recreate with new schema
+    logger.info("Dropping existing tables...")
     cursor.execute('DROP TABLE IF EXISTS traces')
     cursor.execute('DROP TABLE IF EXISTS raw_traces')
     cursor.execute('DROP TABLE IF EXISTS prompts')
@@ -293,25 +312,46 @@ def init_database():
     cursor.execute('CREATE INDEX idx_raw_trace_id ON raw_traces(trace_id)')
 
     conn.commit()
+    logger.info("Database schema created successfully")
     return conn
 
 
 def process_jsonl(sample_size: int = 1000) -> dict:
     """Process JSONL file and store results in database."""
-    logger.info(f"Processing {sample_size} traces from {JSONL_FILE}")
+    start_time = time.time()
+
+    # Log file info
+    if os.path.exists(JSONL_FILE):
+        file_size = os.path.getsize(JSONL_FILE)
+        logger.info(f"=" * 60)
+        logger.info(f"STARTING TRACE PROCESSING")
+        logger.info(f"=" * 60)
+        logger.info(f"Input file: {JSONL_FILE}")
+        logger.info(f"File size: {format_file_size(file_size)}")
+        logger.info(f"Sample size: {sample_size:,} traces")
+        logger.info(f"-" * 60)
+    else:
+        logger.error(f"Input file not found: {JSONL_FILE}")
+        return {'processed': 0, 'errors': 0, 'unique_prompts': 0, 'error': 'File not found'}
 
     conn = init_database()
     cursor = conn.cursor()
 
     # Clear existing data
+    logger.info("Clearing existing data...")
     cursor.execute('DELETE FROM traces')
     cursor.execute('DELETE FROM prompts')
     cursor.execute('DELETE FROM raw_traces')
     conn.commit()
+    logger.info("Existing data cleared")
 
     processed_count = 0
     error_count = 0
     prompt_counts = Counter()
+    model_counts = Counter()
+    batch_start_time = time.time()
+
+    logger.info(f"Starting to read and process traces...")
 
     with open(JSONL_FILE, 'r') as f:
         for line in f:
@@ -347,19 +387,25 @@ def process_jsonl(sample_size: int = 1000) -> dict:
                     ''', (trace_info.element_id, trace_info.trace_id, json.dumps(trace)))
 
                     prompt_counts[trace_info.system_prompt_hash] += 1
+                    model_counts[trace_info.model] += 1
                     processed_count += 1
                 else:
                     error_count += 1
 
             except json.JSONDecodeError as e:
-                logger.error(f"JSON decode error: {e}")
+                logger.error(f"JSON decode error at trace {processed_count + error_count + 1}: {e}")
                 error_count += 1
 
-            if processed_count % 100 == 0:
-                logger.info(f"Processed {processed_count} traces...")
+            if processed_count % 100 == 0 and processed_count > 0:
+                batch_elapsed = time.time() - batch_start_time
+                rate = 100 / batch_elapsed if batch_elapsed > 0 else 0
+                progress_pct = (processed_count / sample_size) * 100
+                logger.info(f"Progress: {processed_count:,}/{sample_size:,} ({progress_pct:.1f}%) - {rate:.0f} traces/sec")
                 conn.commit()
+                batch_start_time = time.time()
 
     # Update prompt counts
+    logger.info("Saving prompt statistics...")
     for prompt_hash, count in prompt_counts.items():
         cursor.execute('''
             INSERT OR REPLACE INTO prompts (prompt_hash, filename, trace_count, first_seen)
@@ -367,19 +413,60 @@ def process_jsonl(sample_size: int = 1000) -> dict:
         ''', (prompt_hash, f"prompt_{prompt_hash}.txt", count))
 
     conn.commit()
+
+    # Get final database size
+    db_size = os.path.getsize(TRACES_DB) if os.path.exists(TRACES_DB) else 0
+
     conn.close()
 
-    logger.info(f"Completed processing: {processed_count} traces, {error_count} errors")
-    logger.info(f"Unique prompts: {len(prompt_counts)}")
+    # Calculate final stats
+    elapsed_time = time.time() - start_time
+    avg_rate = processed_count / elapsed_time if elapsed_time > 0 else 0
+
+    # Log summary
+    logger.info(f"-" * 60)
+    logger.info(f"PROCESSING COMPLETE")
+    logger.info(f"-" * 60)
+    logger.info(f"Total traces processed: {processed_count:,}")
+    logger.info(f"Processing errors: {error_count:,}")
+    logger.info(f"Unique system prompts: {len(prompt_counts)}")
+    logger.info(f"Unique models: {len(model_counts)}")
+    logger.info(f"Total time: {elapsed_time:.2f} seconds")
+    logger.info(f"Average rate: {avg_rate:.0f} traces/second")
+    logger.info(f"Database size: {format_file_size(db_size)}")
+
+    # Log model distribution
+    logger.info(f"-" * 60)
+    logger.info("MODEL DISTRIBUTION:")
+    for model, count in model_counts.most_common():
+        pct = (count / processed_count) * 100 if processed_count > 0 else 0
+        logger.info(f"  {model}: {count:,} ({pct:.1f}%)")
+
+    # Log prompt distribution
+    logger.info(f"-" * 60)
+    logger.info("USE CASE DISTRIBUTION:")
+    for prompt_hash, count in prompt_counts.most_common(5):
+        pct = (count / processed_count) * 100 if processed_count > 0 else 0
+        logger.info(f"  {prompt_hash[:16]}...: {count:,} ({pct:.1f}%)")
+
+    logger.info(f"=" * 60)
 
     return {
         'processed': processed_count,
         'errors': error_count,
-        'unique_prompts': len(prompt_counts)
+        'unique_prompts': len(prompt_counts),
+        'elapsed_time': round(elapsed_time, 2),
+        'traces_per_second': round(avg_rate, 0)
     }
 
 
 if __name__ == "__main__":
-    from config import TEST_SAMPLE_SIZE
-    result = process_jsonl(TEST_SAMPLE_SIZE)
+    import argparse
+    from config import SAMPLE_SIZE
+
+    parser = argparse.ArgumentParser(description="Process LLM traces from JSONL file")
+    parser.add_argument("--size", type=int, default=SAMPLE_SIZE, help=f"Sample size (default: {SAMPLE_SIZE} from config.py)")
+    args = parser.parse_args()
+
+    result = process_jsonl(args.size)
     print(f"\nProcessing complete: {result}")
