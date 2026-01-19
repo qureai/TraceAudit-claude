@@ -6,11 +6,14 @@ from pathlib import Path
 from config import HOST, PORT, PROMPTS_DIR
 from analyzer import (
     run_analysis, get_random_traces_for_use_case, get_trace_detail,
-    get_system_prompt_content, get_traces_with_errors, get_model_stats_by_use_case
+    get_system_prompt_content, get_traces_with_errors, get_model_stats_by_use_case,
+    get_traces_with_multiple_elements, get_filtered_traces, get_available_filters,
+    get_element_detail
 )
 from components import (
     StatCard, ModelDistributionChart, UseCaseCard, TraceListItem,
-    MessageBubble, ErrorDetectionPanel, MetadataStatsPanel, TokenCostPanel, NavBar
+    MessageBubble, ErrorDetectionPanel, MetadataStatsPanel, TokenCostPanel, NavBar,
+    MultiElementStatsPanel, FilterPanel
 )
 
 logging.basicConfig(
@@ -212,13 +215,13 @@ def get():
         Div(
             Div(
                 H2("📊 TraceAudit Dashboard", style="margin: 0;"),
-                P(f"Analyzing {analysis.total_traces:,} traces from {analysis.time_period_start[:10] if analysis.time_period_start != 'Unknown' else 'Unknown'} to {analysis.time_period_end[:10] if analysis.time_period_end != 'Unknown' else 'Unknown'}",
+                P(f"Analyzing {analysis.total_elements:,} elements ({analysis.unique_trace_ids:,} unique traces) from {analysis.time_period_start[:10] if analysis.time_period_start != 'Unknown' else 'Unknown'} to {analysis.time_period_end[:10] if analysis.time_period_end != 'Unknown' else 'Unknown'}",
                   style="margin: 4px 0 0 0; color: #94a3b8;"),
                 cls="section-header"
             ),
             # Top stats
             Div(
-                StatCard("Total Traces", f"{analysis.total_traces:,}", color="#3b82f6"),
+                StatCard("Total Elements", f"{analysis.total_elements:,}", f"{analysis.unique_trace_ids:,} unique traces", "#3b82f6"),
                 StatCard("Unique Use Cases", analysis.unique_use_cases, color="#10b981"),
                 StatCard("Multi-turn", analysis.multi_turn_stats['multi_turn_count'], f"{analysis.multi_turn_stats['avg_turns']:.1f} avg turns", "#8b5cf6"),
                 StatCard("With Tool Calls", analysis.tool_call_stats['with_tool_calls'], color="#f59e0b"),
@@ -227,6 +230,9 @@ def get():
             ),
             # Model distribution
             ModelDistributionChart(analysis.model_distribution),
+            # Multi-element stats panel
+            Div(style="margin-top: 24px;"),
+            MultiElementStatsPanel(analysis.multi_element_stats),
             # Token/Cost metrics
             Div(style="margin-top: 24px;"),
             TokenCostPanel(analysis.token_stats, analysis.cost_stats, analysis.response_time_stats),
@@ -351,8 +357,8 @@ def get(prompt_hash: str):
 
 
 @rt('/trace/{trace_id}')
-def get(trace_id: str):
-    logger.info(f"Loading trace: {trace_id}")
+def get(trace_id: str, element_idx: int = 0):
+    logger.info(f"Loading trace: {trace_id}, element: {element_idx}")
 
     trace_detail = get_trace_detail(trace_id)
     if not trace_detail:
@@ -361,7 +367,15 @@ def get(trace_id: str):
             Div(H2("Trace not found"), cls="main-container")
         )
 
-    raw_data = trace_detail.get('raw_data', {})
+    elements = trace_detail.get('elements', [])
+    element_count = len(elements)
+
+    # Get the selected element (default to first)
+    if element_idx >= element_count:
+        element_idx = 0
+    current_element = elements[element_idx] if elements else {}
+
+    raw_data = current_element.get('raw_data', {})
     request = raw_data.get('request', {})
     response = raw_data.get('response', {})
     messages = request.get('messages', []).copy()
@@ -374,7 +388,7 @@ def get(trace_id: str):
             messages.append(response_msg)
 
     # Get model
-    model = trace_detail.get('model', raw_data.get('ai_model', 'unknown'))
+    model = current_element.get('model', raw_data.get('ai_model', 'unknown'))
 
     # Get system prompt
     system_prompt = get_system_prompt_content(trace_detail.get('system_prompt_hash', ''))
@@ -397,6 +411,30 @@ def get(trace_id: str):
                          turn_number=turn_numbers.get(idx))
         )
 
+    # Element selector if multiple elements
+    element_selector = None
+    if element_count > 1:
+        element_tabs = []
+        for i, el in enumerate(elements):
+            is_active = i == element_idx
+            element_tabs.append(
+                A(
+                    f"Element {i + 1}",
+                    Span(el.get('created_at', '')[:19] if el.get('created_at') else '', style="display: block; font-size: 0.7em; color: #64748b;"),
+                    href=f"/trace/{trace_id}?element_idx={i}",
+                    style=f"padding: 12px 16px; background: {'#3b82f6' if is_active else '#1f2940'}; color: {'white' if is_active else '#94a3b8'}; border-radius: 8px; text-decoration: none; text-align: center; min-width: 100px;"
+                )
+            )
+        element_selector = Div(
+            Div(
+                Span(f"📦 {element_count} Elements", style="font-weight: 600; color: #8b5cf6; margin-right: 16px;"),
+                Span("This trace has multiple elements - click to view each one", style="color: #64748b; font-size: 0.85em;"),
+                style="margin-bottom: 12px;"
+            ),
+            Div(*element_tabs, style="display: flex; gap: 8px; flex-wrap: wrap;"),
+            style="background: #16213e; padding: 16px; border-radius: 12px; border: 1px solid #8b5cf6; margin-bottom: 16px;"
+        )
+
     return Div(
         NavBar("traces"),
         Div(
@@ -405,13 +443,15 @@ def get(trace_id: str):
                 H2(f"Trace: {trace_id[:16]}...", style="margin: 0;"),
                 Div(
                     Span(f"Model: {model}", style="background: #3b82f6; color: white; padding: 4px 12px; border-radius: 4px; font-size: 0.85em; margin-right: 12px;"),
-                    Span(f"{trace_detail.get('num_turns', 0)} turns", style="color: #94a3b8; margin-right: 12px;"),
-                    Span(f"${trace_detail.get('cost', 0):.4f}", style="color: #10b981; margin-right: 12px;"),
-                    Span(f"{trace_detail.get('total_tokens', 0):,} tokens", style="color: #8b5cf6;"),
+                    Span(f"{current_element.get('num_turns', 0)} turns", style="color: #94a3b8; margin-right: 12px;"),
+                    Span(f"${current_element.get('cost', 0):.4f}", style="color: #10b981; margin-right: 12px;"),
+                    Span(f"{current_element.get('total_tokens', 0):,} tokens", style="color: #8b5cf6;"),
+                    Span(f"📦 Element {element_idx + 1}/{element_count}", style="margin-left: 12px; color: #8b5cf6;") if element_count > 1 else None,
                     style="margin-top: 8px;"
                 ),
                 cls="section-header"
             ),
+            element_selector,
             Div(
                 # Left panel - Messages
                 Div(
@@ -430,11 +470,12 @@ def get(trace_id: str):
                     ),
                     # Trace metadata
                     Div(
-                        H4("Trace Metadata", style="margin-bottom: 12px; color: #94a3b8; font-size: 0.85em;"),
-                        Div(f"Created: {trace_detail.get('created_at', 'N/A')}", style="font-size: 0.85em; color: #64748b; margin-bottom: 4px;"),
-                        Div(f"Response Time: {trace_detail.get('response_time', 0)}ms", style="font-size: 0.85em; color: #64748b; margin-bottom: 4px;"),
-                        Div(f"Has Tool Calls: {'Yes' if trace_detail.get('has_tool_calls') else 'No'}", style="font-size: 0.85em; color: #64748b; margin-bottom: 4px;"),
-                        Div(f"Error Indicators: {trace_detail.get('potential_error_indicators') or 'None'}", style=f"font-size: 0.85em; color: {'#f87171' if trace_detail.get('potential_error_indicators') else '#64748b'}; margin-bottom: 4px;"),
+                        H4("Element Metadata", style="margin-bottom: 12px; color: #94a3b8; font-size: 0.85em;"),
+                        Div(f"Element ID: {current_element.get('element_id', 'N/A')[:16]}...", style="font-size: 0.85em; color: #64748b; margin-bottom: 4px;"),
+                        Div(f"Created: {current_element.get('created_at', 'N/A')}", style="font-size: 0.85em; color: #64748b; margin-bottom: 4px;"),
+                        Div(f"Response Time: {current_element.get('response_time', 0)}ms", style="font-size: 0.85em; color: #64748b; margin-bottom: 4px;"),
+                        Div(f"Has Tool Calls: {'Yes' if current_element.get('has_tool_calls') else 'No'}", style="font-size: 0.85em; color: #64748b; margin-bottom: 4px;"),
+                        Div(f"Error Indicators: {current_element.get('potential_error_indicators') or 'None'}", style=f"font-size: 0.85em; color: {'#f87171' if current_element.get('potential_error_indicators') else '#64748b'}; margin-bottom: 4px;"),
                         style="background: #0f0f1a; padding: 12px; border-radius: 8px; margin-bottom: 16px;"
                     ),
                     Pre(system_prompt, style="white-space: pre-wrap; color: #e2e8f0; max-height: calc(100vh - 450px); overflow-y: auto;"),
@@ -514,44 +555,41 @@ def get():
 
 
 @rt('/traces')
-def get(page: int = 1, limit: int = 50):
-    logger.info(f"Loading all traces page {page}")
+def get(page: int = 1, limit: int = 50, model: str = None, use_case: str = None, has_errors: str = None, multi_element_only: str = None):
+    logger.info(f"Loading all traces page {page} with filters")
 
-    from analyzer import get_db_connection
+    # Parse boolean filters
+    has_errors_bool = has_errors == 'true' if has_errors else None
+    multi_element_bool = multi_element_only == 'true' if multi_element_only else False
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    # Get filtered traces
+    traces, total = get_filtered_traces(
+        page=page,
+        limit=limit,
+        model=model if model else None,
+        use_case=use_case if use_case else None,
+        has_errors=has_errors_bool,
+        multi_element_only=multi_element_bool
+    )
 
-    # Get total count
-    cursor.execute('SELECT COUNT(*) FROM traces')
-    total = cursor.fetchone()[0]
-
-    # Get paginated traces
-    offset = (page - 1) * limit
-    cursor.execute('''
-        SELECT trace_id, model, num_turns, has_tool_calls, cost, total_tokens,
-               potential_error_indicators, user_disagreement_detected
-        FROM traces
-        ORDER BY parsed_timestamp DESC
-        LIMIT ? OFFSET ?
-    ''', (limit, offset))
-
-    traces = []
-    for row in cursor.fetchall():
-        traces.append({
-            'trace_id': row[0],
-            'model': row[1],
-            'num_turns': row[2],
-            'has_tool_calls': bool(row[3]),
-            'cost': row[4],
-            'total_tokens': row[5],
-            'potential_error_indicators': row[6],
-            'user_disagreement_detected': bool(row[7])
-        })
-
-    conn.close()
+    # Get available filters
+    filters = get_available_filters()
 
     total_pages = (total + limit - 1) // limit
+    offset = (page - 1) * limit
+
+    # Build query string for pagination
+    query_parts = []
+    if model:
+        query_parts.append(f"model={model}")
+    if use_case:
+        query_parts.append(f"use_case={use_case}")
+    if has_errors:
+        query_parts.append(f"has_errors={has_errors}")
+    if multi_element_only:
+        query_parts.append(f"multi_element_only={multi_element_only}")
+    query_string = "&".join(query_parts)
+    query_suffix = f"&{query_string}" if query_string else ""
 
     return Div(
         NavBar("traces"),
@@ -559,22 +597,100 @@ def get(page: int = 1, limit: int = 50):
             A("← Back to Dashboard", href="/", cls="back-link"),
             Div(
                 H2("📋 All Traces", style="margin: 0;"),
-                P(f"Showing {offset + 1}-{min(offset + limit, total)} of {total:,} traces", style="margin: 4px 0 0 0; color: #94a3b8;"),
+                P(f"Showing {offset + 1}-{min(offset + limit, total)} of {total:,} elements", style="margin: 4px 0 0 0; color: #94a3b8;"),
                 cls="section-header"
             ),
-            *[TraceListItem(trace) for trace in traces],
-            # Pagination
             Div(
-                A("← Previous",
-                  href=f"/traces?page={page-1}" if page > 1 else None,
-                  cls=f"page-btn {'page-btn-active' if page > 1 else 'page-btn-disabled'}",
-                  style="margin-right: 12px;"),
-                Span(f"Page {page} of {total_pages}", style="color: #94a3b8; font-weight: 500;"),
-                A("Next →",
-                  href=f"/traces?page={page+1}" if page < total_pages else None,
-                  cls=f"page-btn {'page-btn-active' if page < total_pages else 'page-btn-disabled'}",
-                  style="margin-left: 12px;"),
-                style="display: flex; align-items: center; justify-content: center; margin-top: 24px; padding: 16px;"
+                # Filter panel on the left
+                Div(
+                    FilterPanel(filters, current_model=model, current_use_case=use_case, has_errors=has_errors_bool, multi_element_only=multi_element_bool),
+                    style="width: 280px; flex-shrink: 0;"
+                ),
+                # Traces list on the right
+                Div(
+                    *[TraceListItem(trace) for trace in traces],
+                    # Pagination
+                    Div(
+                        A("← Previous",
+                          href=f"/traces?page={page-1}{query_suffix}" if page > 1 else None,
+                          cls=f"page-btn {'page-btn-active' if page > 1 else 'page-btn-disabled'}",
+                          style="margin-right: 12px;"),
+                        Span(f"Page {page} of {total_pages}", style="color: #94a3b8; font-weight: 500;"),
+                        A("Next →",
+                          href=f"/traces?page={page+1}{query_suffix}" if page < total_pages else None,
+                          cls=f"page-btn {'page-btn-active' if page < total_pages else 'page-btn-disabled'}",
+                          style="margin-left: 12px;"),
+                        style="display: flex; align-items: center; justify-content: center; margin-top: 24px; padding: 16px;"
+                    ),
+                    style="flex: 1;"
+                ),
+                style="display: flex; gap: 24px;"
+            ),
+            cls="main-container"
+        )
+    )
+
+
+@rt('/multi-element')
+def get():
+    logger.info("Loading multi-element traces page")
+
+    traces = get_traces_with_multiple_elements(limit=100)
+    analysis = run_analysis()
+
+    return Div(
+        NavBar("multi-element"),
+        Div(
+            A("← Back to Dashboard", href="/", cls="back-link"),
+            Div(
+                H2("📦 Traces with Multiple Elements", style="margin: 0;"),
+                P(f"{len(traces)} traces found with multiple elements", style="margin: 4px 0 0 0; color: #94a3b8;"),
+                cls="section-header"
+            ),
+            # Stats panel
+            MultiElementStatsPanel(analysis.multi_element_stats),
+            # Explanation
+            Div(
+                H3("What are Multi-Element Traces?", style="margin-bottom: 12px; color: #e2e8f0;"),
+                P("Each trace can have multiple elements representing different stages or retries of the same conversation. "
+                  "These might occur due to retries, different model calls, or progressive conversation building.",
+                  style="color: #94a3b8; font-size: 0.9em; line-height: 1.6;"),
+                style="background: #1f2940; padding: 20px; border-radius: 12px; border: 1px solid #2d3748; margin: 24px 0;"
+            ),
+            # Trace list
+            Div(
+                H3("Multi-Element Traces", style="margin-bottom: 16px; color: #e2e8f0;"),
+                *[
+                    A(
+                        Div(
+                            Div(
+                                Div(
+                                    Span(f"Trace: {trace['trace_id'][:16]}...", style="font-weight: 600; color: #e2e8f0;"),
+                                    Span(f"📦 {trace['element_count']} elements", style="background: #8b5cf6; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75em; margin-left: 12px;"),
+                                    style="display: flex; align-items: center;"
+                                ),
+                                Div(
+                                    Span(f"Models: {trace['models']}", style="color: #94a3b8; font-size: 0.85em;"),
+                                    style="margin-top: 4px;"
+                                ),
+                                style="flex: 1;"
+                            ),
+                            Div(
+                                Div(f"First: {trace['first_created'][:19] if trace['first_created'] else 'N/A'}", style="font-size: 0.8em; color: #64748b;"),
+                                Div(f"Last: {trace['last_created'][:19] if trace['last_created'] else 'N/A'}", style="font-size: 0.8em; color: #64748b;"),
+                                style="text-align: right;"
+                            ),
+                            style="display: flex; justify-content: space-between; padding: 16px;"
+                        ),
+                        href=f"/trace/{trace['trace_id']}",
+                        style="display: block; background: #1f2940; border-radius: 8px; border: 1px solid #2d3748; text-decoration: none; margin-bottom: 8px; transition: all 0.2s;",
+                        cls="trace-item"
+                    )
+                    for trace in traces
+                ],
+                style="max-height: 600px; overflow-y: auto;"
+            ) if traces else Div(
+                P("No traces with multiple elements found", style="color: #64748b; text-align: center; padding: 40px;")
             ),
             cls="main-container"
         )

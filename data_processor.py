@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TraceInfo:
     trace_id: str
+    element_id: str  # Unique ID for this specific element (from 'id' field)
     created_at: str
     parsed_timestamp: Optional[str]
     model: str
@@ -206,7 +207,8 @@ def process_trace(trace: dict) -> Optional[TraceInfo]:
         error_indicators = detect_error_indicators(trace)
 
         return TraceInfo(
-            trace_id=trace.get('trace_id', trace.get('id', '')),
+            trace_id=trace.get('trace_id', ''),
+            element_id=trace.get('id', ''),  # Unique element ID
             created_at=created_at,
             parsed_timestamp=parsed_ts.isoformat() if parsed_ts else None,
             model=trace.get('ai_model', request.get('model', 'unknown')),
@@ -236,9 +238,15 @@ def init_database():
     conn = sqlite3.connect(TRACES_DB)
     cursor = conn.cursor()
 
+    # Drop old tables to recreate with new schema
+    cursor.execute('DROP TABLE IF EXISTS traces')
+    cursor.execute('DROP TABLE IF EXISTS raw_traces')
+    cursor.execute('DROP TABLE IF EXISTS prompts')
+
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS traces (
-            trace_id TEXT PRIMARY KEY,
+        CREATE TABLE traces (
+            element_id TEXT PRIMARY KEY,
+            trace_id TEXT,
             created_at TEXT,
             parsed_timestamp TEXT,
             model TEXT,
@@ -260,8 +268,14 @@ def init_database():
         )
     ''')
 
+    # Index on trace_id for grouping
+    cursor.execute('CREATE INDEX idx_trace_id ON traces(trace_id)')
+    cursor.execute('CREATE INDEX idx_system_prompt_hash ON traces(system_prompt_hash)')
+    cursor.execute('CREATE INDEX idx_model ON traces(model)')
+    cursor.execute('CREATE INDEX idx_parsed_timestamp ON traces(parsed_timestamp)')
+
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS prompts (
+        CREATE TABLE prompts (
             prompt_hash TEXT PRIMARY KEY,
             filename TEXT,
             trace_count INTEGER,
@@ -270,11 +284,13 @@ def init_database():
     ''')
 
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS raw_traces (
-            trace_id TEXT PRIMARY KEY,
+        CREATE TABLE raw_traces (
+            element_id TEXT PRIMARY KEY,
+            trace_id TEXT,
             data TEXT
         )
     ''')
+    cursor.execute('CREATE INDEX idx_raw_trace_id ON raw_traces(trace_id)')
 
     conn.commit()
     return conn
@@ -307,11 +323,12 @@ def process_jsonl(sample_size: int = 1000) -> dict:
                 trace_info = process_trace(trace)
 
                 if trace_info:
-                    # Insert trace info
+                    # Insert trace info (element_id as primary key)
                     cursor.execute('''
-                        INSERT OR REPLACE INTO traces VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT OR REPLACE INTO traces VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
-                        trace_info.trace_id, trace_info.created_at, trace_info.parsed_timestamp,
+                        trace_info.element_id, trace_info.trace_id,
+                        trace_info.created_at, trace_info.parsed_timestamp,
                         trace_info.model, trace_info.cost, trace_info.total_tokens,
                         trace_info.prompt_tokens, trace_info.completion_tokens, trace_info.response_time,
                         trace_info.system_prompt_hash, trace_info.system_prompt_file,
@@ -324,10 +341,10 @@ def process_jsonl(sample_size: int = 1000) -> dict:
                         trace_info.potential_error_indicators
                     ))
 
-                    # Store raw trace for viewing
+                    # Store raw trace for viewing (element_id as primary key)
                     cursor.execute('''
-                        INSERT OR REPLACE INTO raw_traces VALUES (?, ?)
-                    ''', (trace_info.trace_id, json.dumps(trace)))
+                        INSERT OR REPLACE INTO raw_traces VALUES (?, ?, ?)
+                    ''', (trace_info.element_id, trace_info.trace_id, json.dumps(trace)))
 
                     prompt_counts[trace_info.system_prompt_hash] += 1
                     processed_count += 1

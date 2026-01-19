@@ -11,7 +11,8 @@ from config import TRACES_DB, PROMPTS_DIR, ANALYSIS_CACHE
 
 @dataclass
 class AnalysisResult:
-    total_traces: int
+    total_elements: int  # Total trace elements (rows in DB)
+    unique_trace_ids: int  # Unique trace IDs
     unique_use_cases: int
     time_period_start: str
     time_period_end: str
@@ -25,6 +26,7 @@ class AnalysisResult:
     cost_stats: dict
     token_stats: dict
     response_time_stats: dict
+    multi_element_stats: dict  # Stats about traces with multiple elements
 
 
 def get_db_connection():
@@ -36,13 +38,36 @@ def run_analysis() -> AnalysisResult:
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Total traces
+    # Total elements (rows)
     cursor.execute('SELECT COUNT(*) FROM traces')
-    total_traces = cursor.fetchone()[0]
+    total_elements = cursor.fetchone()[0]
+
+    # Unique trace IDs
+    cursor.execute('SELECT COUNT(DISTINCT trace_id) FROM traces')
+    unique_trace_ids = cursor.fetchone()[0]
 
     # Unique use cases (system prompts)
     cursor.execute('SELECT COUNT(DISTINCT system_prompt_hash) FROM traces')
     unique_use_cases = cursor.fetchone()[0]
+
+    # Multi-element trace stats
+    cursor.execute('''
+        SELECT trace_id, COUNT(*) as element_count
+        FROM traces
+        GROUP BY trace_id
+        HAVING COUNT(*) > 1
+    ''')
+    multi_element_traces = cursor.fetchall()
+    traces_with_multiple_elements = len(multi_element_traces)
+    max_elements_per_trace = max([r[1] for r in multi_element_traces]) if multi_element_traces else 1
+    avg_elements_per_trace = sum([r[1] for r in multi_element_traces]) / len(multi_element_traces) if multi_element_traces else 1
+
+    multi_element_stats = {
+        'traces_with_multiple_elements': traces_with_multiple_elements,
+        'max_elements_per_trace': max_elements_per_trace,
+        'avg_elements_per_trace': round(avg_elements_per_trace, 2),
+        'total_extra_elements': total_elements - unique_trace_ids
+    }
 
     # Time period
     cursor.execute('''
@@ -230,7 +255,8 @@ def run_analysis() -> AnalysisResult:
     conn.close()
 
     result = AnalysisResult(
-        total_traces=total_traces,
+        total_elements=total_elements,
+        unique_trace_ids=unique_trace_ids,
         unique_use_cases=unique_use_cases,
         time_period_start=time_start,
         time_period_end=time_end,
@@ -243,7 +269,8 @@ def run_analysis() -> AnalysisResult:
         error_detection_stats=error_detection_stats,
         cost_stats=cost_stats,
         token_stats=token_stats,
-        response_time_stats=response_time_stats
+        response_time_stats=response_time_stats,
+        multi_element_stats=multi_element_stats
     )
 
     # Cache the result
@@ -259,9 +286,10 @@ def get_random_traces_for_use_case(prompt_hash: str, limit: int = 5) -> list[dic
     cursor = conn.cursor()
 
     cursor.execute('''
-        SELECT t.trace_id, t.model, t.num_turns, t.has_tool_calls,
+        SELECT t.element_id, t.trace_id, t.model, t.num_turns, t.has_tool_calls,
                t.cost, t.total_tokens, t.response_time, t.created_at,
-               t.potential_error_indicators, t.user_disagreement_detected
+               t.potential_error_indicators, t.user_disagreement_detected,
+               (SELECT COUNT(*) FROM traces t2 WHERE t2.trace_id = t.trace_id) as element_count
         FROM traces t
         WHERE t.system_prompt_hash = ?
         ORDER BY RANDOM()
@@ -271,16 +299,18 @@ def get_random_traces_for_use_case(prompt_hash: str, limit: int = 5) -> list[dic
     traces = []
     for row in cursor.fetchall():
         traces.append({
-            'trace_id': row[0],
-            'model': row[1],
-            'num_turns': row[2],
-            'has_tool_calls': bool(row[3]),
-            'cost': row[4],
-            'total_tokens': row[5],
-            'response_time': row[6],
-            'created_at': row[7],
-            'potential_error_indicators': row[8],
-            'user_disagreement_detected': bool(row[9])
+            'element_id': row[0],
+            'trace_id': row[1],
+            'model': row[2],
+            'num_turns': row[3],
+            'has_tool_calls': bool(row[4]),
+            'cost': row[5],
+            'total_tokens': row[6],
+            'response_time': row[7],
+            'created_at': row[8],
+            'potential_error_indicators': row[9],
+            'user_disagreement_detected': bool(row[10]),
+            'element_count': row[11]
         })
 
     conn.close()
@@ -288,28 +318,77 @@ def get_random_traces_for_use_case(prompt_hash: str, limit: int = 5) -> list[dic
 
 
 def get_trace_detail(trace_id: str) -> Optional[dict]:
-    """Get full trace detail including raw data."""
+    """Get full trace detail including all elements for this trace_id."""
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Get trace info
-    cursor.execute('SELECT * FROM traces WHERE trace_id = ?', (trace_id,))
+    # Get all elements for this trace_id, ordered by timestamp
+    cursor.execute('''
+        SELECT * FROM traces
+        WHERE trace_id = ?
+        ORDER BY parsed_timestamp ASC
+    ''', (trace_id,))
+    rows = cursor.fetchall()
+
+    if not rows:
+        conn.close()
+        return None
+
+    columns = [desc[0] for desc in cursor.description]
+
+    # Build list of all elements
+    elements = []
+    for row in rows:
+        element_info = dict(zip(columns, row))
+
+        # Get raw data for this element
+        cursor.execute('SELECT data FROM raw_traces WHERE element_id = ?', (element_info['element_id'],))
+        raw_row = cursor.fetchone()
+        if raw_row:
+            element_info['raw_data'] = json.loads(raw_row[0])
+
+        elements.append(element_info)
+
+    conn.close()
+
+    # Return combined info
+    return {
+        'trace_id': trace_id,
+        'element_count': len(elements),
+        'elements': elements,
+        # Use first element for summary info
+        'model': elements[0].get('model'),
+        'system_prompt_hash': elements[0].get('system_prompt_hash'),
+        'system_prompt_file': elements[0].get('system_prompt_file'),
+    }
+
+
+def get_element_detail(element_id: str) -> Optional[dict]:
+    """Get detail for a specific element."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT * FROM traces WHERE element_id = ?', (element_id,))
     row = cursor.fetchone()
     if not row:
         conn.close()
         return None
 
     columns = [desc[0] for desc in cursor.description]
-    trace_info = dict(zip(columns, row))
+    element_info = dict(zip(columns, row))
 
-    # Get raw trace data
-    cursor.execute('SELECT data FROM raw_traces WHERE trace_id = ?', (trace_id,))
+    # Get raw data
+    cursor.execute('SELECT data FROM raw_traces WHERE element_id = ?', (element_id,))
     raw_row = cursor.fetchone()
     if raw_row:
-        trace_info['raw_data'] = json.loads(raw_row[0])
+        element_info['raw_data'] = json.loads(raw_row[0])
+
+    # Get element count for this trace
+    cursor.execute('SELECT COUNT(*) FROM traces WHERE trace_id = ?', (element_info['trace_id'],))
+    element_info['total_elements'] = cursor.fetchone()[0]
 
     conn.close()
-    return trace_info
+    return element_info
 
 
 def get_system_prompt_content(prompt_hash: str) -> str:
@@ -327,11 +406,47 @@ def get_traces_with_errors(limit: int = 50) -> list[dict]:
     cursor = conn.cursor()
 
     cursor.execute('''
-        SELECT trace_id, model, system_prompt_hash, num_turns,
-               potential_error_indicators, user_disagreement_detected, created_at
+        SELECT element_id, trace_id, model, system_prompt_hash, num_turns,
+               potential_error_indicators, user_disagreement_detected, created_at,
+               (SELECT COUNT(*) FROM traces t2 WHERE t2.trace_id = traces.trace_id) as element_count
         FROM traces
         WHERE potential_error_indicators != '' OR user_disagreement_detected = 1
-        ORDER BY created_at DESC
+        ORDER BY parsed_timestamp DESC
+        LIMIT ?
+    ''', (limit,))
+
+    traces = []
+    for row in cursor.fetchall():
+        traces.append({
+            'element_id': row[0],
+            'trace_id': row[1],
+            'model': row[2],
+            'system_prompt_hash': row[3],
+            'num_turns': row[4],
+            'potential_error_indicators': row[5],
+            'user_disagreement_detected': bool(row[6]),
+            'created_at': row[7],
+            'element_count': row[8]
+        })
+
+    conn.close()
+    return traces
+
+
+def get_traces_with_multiple_elements(limit: int = 50) -> list[dict]:
+    """Get traces that have multiple elements."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        SELECT trace_id, COUNT(*) as element_count,
+               MIN(created_at) as first_created,
+               MAX(created_at) as last_created,
+               GROUP_CONCAT(DISTINCT model) as models
+        FROM traces
+        GROUP BY trace_id
+        HAVING COUNT(*) > 1
+        ORDER BY element_count DESC
         LIMIT ?
     ''', (limit,))
 
@@ -339,16 +454,136 @@ def get_traces_with_errors(limit: int = 50) -> list[dict]:
     for row in cursor.fetchall():
         traces.append({
             'trace_id': row[0],
-            'model': row[1],
-            'system_prompt_hash': row[2],
-            'num_turns': row[3],
-            'potential_error_indicators': row[4],
-            'user_disagreement_detected': bool(row[5]),
-            'created_at': row[6]
+            'element_count': row[1],
+            'first_created': row[2],
+            'last_created': row[3],
+            'models': row[4]
         })
 
     conn.close()
     return traces
+
+
+def get_filtered_traces(
+    page: int = 1,
+    limit: int = 50,
+    model: str = None,
+    use_case: str = None,
+    has_errors: bool = None,
+    multi_element_only: bool = False
+) -> tuple[list[dict], int]:
+    """Get filtered list of traces with pagination."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Build WHERE clause
+    conditions = []
+    params = []
+
+    if model:
+        conditions.append('model = ?')
+        params.append(model)
+
+    if use_case:
+        conditions.append('system_prompt_hash = ?')
+        params.append(use_case)
+
+    if has_errors:
+        conditions.append("(potential_error_indicators != '' OR user_disagreement_detected = 1)")
+
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    # Get total count
+    if multi_element_only:
+        count_sql = f'''
+            SELECT COUNT(DISTINCT trace_id) FROM traces {where_clause}
+            WHERE trace_id IN (
+                SELECT trace_id FROM traces GROUP BY trace_id HAVING COUNT(*) > 1
+            )
+        '''
+    else:
+        count_sql = f'SELECT COUNT(*) FROM traces {where_clause}'
+
+    cursor.execute(count_sql, params)
+    total = cursor.fetchone()[0]
+
+    # Get traces
+    offset = (page - 1) * limit
+
+    if multi_element_only:
+        sql = f'''
+            SELECT element_id, trace_id, model, num_turns, has_tool_calls, cost,
+                   total_tokens, response_time, created_at, potential_error_indicators,
+                   user_disagreement_detected, system_prompt_hash,
+                   (SELECT COUNT(*) FROM traces t2 WHERE t2.trace_id = traces.trace_id) as element_count
+            FROM traces
+            {where_clause}
+            {'AND' if where_clause else 'WHERE'} trace_id IN (
+                SELECT trace_id FROM traces GROUP BY trace_id HAVING COUNT(*) > 1
+            )
+            ORDER BY parsed_timestamp DESC
+            LIMIT ? OFFSET ?
+        '''
+    else:
+        sql = f'''
+            SELECT element_id, trace_id, model, num_turns, has_tool_calls, cost,
+                   total_tokens, response_time, created_at, potential_error_indicators,
+                   user_disagreement_detected, system_prompt_hash,
+                   (SELECT COUNT(*) FROM traces t2 WHERE t2.trace_id = traces.trace_id) as element_count
+            FROM traces
+            {where_clause}
+            ORDER BY parsed_timestamp DESC
+            LIMIT ? OFFSET ?
+        '''
+
+    cursor.execute(sql, params + [limit, offset])
+
+    traces = []
+    for row in cursor.fetchall():
+        traces.append({
+            'element_id': row[0],
+            'trace_id': row[1],
+            'model': row[2],
+            'num_turns': row[3],
+            'has_tool_calls': bool(row[4]),
+            'cost': row[5],
+            'total_tokens': row[6],
+            'response_time': row[7],
+            'created_at': row[8],
+            'potential_error_indicators': row[9],
+            'user_disagreement_detected': bool(row[10]),
+            'system_prompt_hash': row[11],
+            'element_count': row[12]
+        })
+
+    conn.close()
+    return traces, total
+
+
+def get_available_filters() -> dict:
+    """Get available filter options."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Get unique models
+    cursor.execute('SELECT DISTINCT model FROM traces ORDER BY model')
+    models = [row[0] for row in cursor.fetchall()]
+
+    # Get unique use cases with counts
+    cursor.execute('''
+        SELECT system_prompt_hash, COUNT(*) as count
+        FROM traces
+        GROUP BY system_prompt_hash
+        ORDER BY count DESC
+    ''')
+    use_cases = [{'hash': row[0], 'count': row[1]} for row in cursor.fetchall()]
+
+    conn.close()
+
+    return {
+        'models': models,
+        'use_cases': use_cases
+    }
 
 
 def get_model_stats_by_use_case() -> dict:
@@ -383,8 +618,10 @@ def get_model_stats_by_use_case() -> dict:
 if __name__ == "__main__":
     result = run_analysis()
     print("\n=== ANALYSIS RESULTS ===")
-    print(f"Total traces: {result.total_traces}")
+    print(f"Total elements: {result.total_elements}")
+    print(f"Unique trace IDs: {result.unique_trace_ids}")
     print(f"Unique use cases: {result.unique_use_cases}")
+    print(f"Multi-element stats: {result.multi_element_stats}")
     print(f"Time period: {result.time_period_start} to {result.time_period_end}")
     print(f"Models: {result.model_distribution}")
     print(f"Cost stats: {result.cost_stats}")

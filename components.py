@@ -81,10 +81,23 @@ def TraceListItem(trace: dict, show_use_case: bool = False):
             style="margin-top: 8px;"
         )
 
+    # Multi-element badge
+    element_count = trace.get('element_count', 1)
+    multi_element_badge = None
+    if element_count > 1:
+        multi_element_badge = Span(
+            f"📦 {element_count} elements",
+            style="background: #8b5cf6; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.7em; margin-left: 8px;"
+        )
+
     return A(
         Div(
             Div(
-                Div(f"Trace: {trace['trace_id'][:16]}...", style="font-weight: 600; color: #e2e8f0;"),
+                Div(
+                    Span(f"Trace: {trace['trace_id'][:16]}...", style="font-weight: 600; color: #e2e8f0;"),
+                    multi_element_badge,
+                    style="display: flex; align-items: center;"
+                ),
                 Div(
                     Span(trace['model'].split('/')[-1], style="background: #3b82f6; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75em;"),
                     Span(f"{trace['num_turns']} turn{'s' if trace['num_turns'] > 1 else ''}", style="margin-left: 8px; color: #94a3b8; font-size: 0.85em;"),
@@ -265,6 +278,7 @@ def NavBar(active: str = "dashboard"):
     links = [
         ("Dashboard", "/", "dashboard"),
         ("Use Cases", "/use-cases", "use-cases"),
+        ("Multi-Element", "/multi-element", "multi-element"),
         ("Errors", "/errors", "errors"),
         ("All Traces", "/traces", "traces"),
     ]
@@ -285,4 +299,89 @@ def NavBar(active: str = "dashboard"):
             style="display: flex; gap: 8px;"
         ),
         style="display: flex; justify-content: space-between; align-items: center; padding: 16px 24px; background: #16213e; border-bottom: 1px solid #2d3748;"
+    )
+
+
+def MultiElementStatsPanel(stats: dict):
+    return Div(
+        H3("📦 Multi-Element Traces", style="margin-bottom: 16px; color: #8b5cf6;"),
+        Div(
+            StatCard("Traces with Multiple Elements", stats.get('traces_with_multiple_elements', 0), color="#8b5cf6"),
+            StatCard("Max Elements/Trace", stats.get('max_elements_per_trace', 1), color="#ec4899"),
+            StatCard("Avg Elements/Trace", stats.get('avg_elements_per_trace', 1), color="#f59e0b"),
+            StatCard("Extra Elements", stats.get('total_extra_elements', 0), "Beyond unique trace IDs", "#6b7280"),
+            style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px;"
+        ),
+        A("View All Multi-Element Traces →", href="/multi-element", style="display: block; margin-top: 16px; color: #8b5cf6; text-decoration: none;"),
+        style="background: #1f2940; padding: 20px; border-radius: 12px; border: 1px solid #2d3748;"
+    )
+
+
+def FilterPanel(filters: dict, current_model: str = None, current_use_case: str = None, has_errors: bool = None, multi_element_only: bool = False):
+    return Div(
+        H4("Filters", style="margin-bottom: 12px; color: #e2e8f0;"),
+        Form(
+            Div(
+                Label("Model:", style="color: #94a3b8; font-size: 0.85em;"),
+                Select(
+                    Option("All Models", value="", selected=not current_model),
+                    *[Option(m.split('/')[-1], value=m, selected=m == current_model) for m in filters.get('models', [])],
+                    name="model",
+                    style="width: 100%; padding: 8px; background: #0f0f1a; color: #e2e8f0; border: 1px solid #2d3748; border-radius: 4px;"
+                ),
+                style="margin-bottom: 12px;"
+            ),
+            Div(
+                Label("Use Case:", style="color: #94a3b8; font-size: 0.85em;"),
+                Select(
+                    Option("All Use Cases", value="", selected=not current_use_case),
+                    *[Option(f"{uc['hash'][:8]}... ({uc['count']})", value=uc['hash'], selected=uc['hash'] == current_use_case) for uc in filters.get('use_cases', [])],
+                    name="use_case",
+                    style="width: 100%; padding: 8px; background: #0f0f1a; color: #e2e8f0; border: 1px solid #2d3748; border-radius: 4px;"
+                ),
+                style="margin-bottom: 12px;"
+            ),
+            Div(
+                Label(
+                    Input(type="checkbox", name="has_errors", value="true", checked=has_errors, style="margin-right: 8px;"),
+                    Span("With Errors Only", style="color: #94a3b8; font-size: 0.85em;"),
+                ),
+                style="margin-bottom: 12px;"
+            ),
+            Div(
+                Label(
+                    Input(type="checkbox", name="multi_element_only", value="true", checked=multi_element_only, style="margin-right: 8px;"),
+                    Span("Multi-Element Only", style="color: #94a3b8; font-size: 0.85em;"),
+                ),
+                style="margin-bottom: 12px;"
+            ),
+            Button("Apply Filters", type="submit", style="width: 100%; padding: 10px; background: #3b82f6; color: white; border: none; border-radius: 6px; cursor: pointer;"),
+            A("Clear Filters", href="/traces", style="display: block; text-align: center; margin-top: 8px; color: #64748b; font-size: 0.85em;"),
+            method="get",
+            action="/traces"
+        ),
+        style="background: #1f2940; padding: 16px; border-radius: 12px; border: 1px solid #2d3748; margin-bottom: 16px;"
+    )
+
+
+def ElementCard(element: dict, index: int, total: int):
+    """Card for displaying a single trace element in a multi-element trace view."""
+    return Div(
+        Div(
+            Div(
+                Span(f"Element {index + 1} of {total}", style="font-weight: 600; color: #e2e8f0;"),
+                Span(element.get('model', 'unknown').split('/')[-1], style="background: #3b82f6; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75em; margin-left: 12px;"),
+                style="display: flex; align-items: center;"
+            ),
+            Div(element.get('created_at', 'N/A'), style="font-size: 0.8em; color: #64748b; margin-top: 4px;"),
+            style="flex: 1;"
+        ),
+        Div(
+            Div(f"${element.get('cost', 0):.4f}", style="font-size: 0.85em; color: #10b981;"),
+            Div(f"{element.get('total_tokens', 0):,} tokens", style="font-size: 0.75em; color: #64748b;"),
+            Div(f"{element.get('num_turns', 0)} turns", style="font-size: 0.75em; color: #94a3b8;"),
+            style="text-align: right;"
+        ),
+        style="display: flex; justify-content: space-between; padding: 16px; background: #16213e; border-radius: 8px; border: 1px solid #2d3748; margin-bottom: 8px; cursor: pointer;",
+        onclick=f"showElement({index})"
     )
