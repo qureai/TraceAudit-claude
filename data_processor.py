@@ -316,6 +316,73 @@ def init_database():
     return conn
 
 
+def is_progressive_build(elements: list) -> bool:
+    """
+    Detect if a group of elements represents a progressive conversation build.
+
+    Progressive build pattern:
+    - Message counts are non-decreasing when sorted by time (allows duplicates)
+    - Last element has more messages than first (conversation grew)
+    - Same conversation being built up (later elements contain earlier messages)
+
+    Separate elements pattern:
+    - Message counts decrease at some point (e.g., 5, 5, 5 - retries with same content)
+    - Or all elements have same message count
+    - Different interactions with same trace_id
+    """
+    if len(elements) <= 1:
+        return False
+
+    # Sort by parsed timestamp
+    sorted_elements = sorted(elements, key=lambda x: x['parsed_timestamp'] or '')
+
+    # Get message counts in time order
+    msg_counts = [e['num_messages'] for e in sorted_elements]
+
+    # Check if non-decreasing (allows duplicates but no decreases)
+    is_non_decreasing = all(msg_counts[i] <= msg_counts[i+1] for i in range(len(msg_counts)-1))
+
+    # Also require that the conversation actually grew (last > first)
+    conversation_grew = msg_counts[-1] > msg_counts[0]
+
+    return is_non_decreasing and conversation_grew
+
+
+def filter_progressive_builds(trace_groups: dict) -> list:
+    """
+    Filter trace groups to handle progressive builds.
+
+    For progressive builds: keep only the latest element (has all messages)
+    For separate elements: keep all elements
+
+    Returns list of (trace_info, raw_trace) tuples to insert.
+    """
+    filtered = []
+    progressive_count = 0
+    elements_removed = 0
+
+    for trace_id, elements in trace_groups.items():
+        if len(elements) == 1:
+            # Single element, keep it
+            filtered.append(elements[0])
+        elif is_progressive_build(elements):
+            # Progressive build - keep only the latest (most messages)
+            progressive_count += 1
+            elements_removed += len(elements) - 1
+            # Sort by timestamp and keep the last one
+            sorted_elements = sorted(elements, key=lambda x: x['parsed_timestamp'] or '')
+            filtered.append(sorted_elements[-1])
+        else:
+            # Separate elements - keep all
+            filtered.extend(elements)
+
+    if progressive_count > 0:
+        logger.info(f"Detected {progressive_count} progressive conversation builds")
+        logger.info(f"Removed {elements_removed} intermediate elements (keeping latest with full conversation)")
+
+    return filtered
+
+
 def process_jsonl(sample_size: int = 1000) -> dict:
     """Process JSONL file and store results in database."""
     start_time = time.time()
@@ -334,6 +401,59 @@ def process_jsonl(sample_size: int = 1000) -> dict:
         logger.error(f"Input file not found: {JSONL_FILE}")
         return {'processed': 0, 'errors': 0, 'unique_prompts': 0, 'error': 'File not found'}
 
+    # Phase 1: Read all traces and group by trace_id
+    logger.info("Phase 1: Reading and grouping traces by trace_id...")
+    trace_groups = {}  # trace_id -> list of (trace_info, raw_trace)
+    read_count = 0
+    error_count = 0
+    batch_start_time = time.time()
+
+    with open(JSONL_FILE, 'r') as f:
+        for line in f:
+            if read_count >= sample_size:
+                break
+
+            try:
+                trace = json.loads(line)
+                trace_info = process_trace(trace)
+
+                if trace_info:
+                    # Group by trace_id
+                    if trace_info.trace_id not in trace_groups:
+                        trace_groups[trace_info.trace_id] = []
+                    trace_groups[trace_info.trace_id].append({
+                        'trace_info': trace_info,
+                        'raw_trace': trace,
+                        'parsed_timestamp': trace_info.parsed_timestamp,
+                        'num_messages': trace_info.num_messages
+                    })
+                    read_count += 1
+                else:
+                    error_count += 1
+
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decode error at line {read_count + error_count + 1}: {e}")
+                error_count += 1
+
+            if read_count % 1000 == 0 and read_count > 0:
+                batch_elapsed = time.time() - batch_start_time
+                rate = 1000 / batch_elapsed if batch_elapsed > 0 else 0
+                progress_pct = (read_count / sample_size) * 100
+                logger.info(f"Reading: {read_count:,}/{sample_size:,} ({progress_pct:.1f}%) - {rate:.0f} traces/sec")
+                batch_start_time = time.time()
+
+    logger.info(f"Read {read_count:,} elements across {len(trace_groups):,} unique trace_ids")
+
+    # Phase 2: Filter progressive builds
+    logger.info("-" * 60)
+    logger.info("Phase 2: Detecting and filtering progressive conversation builds...")
+    filtered_elements = filter_progressive_builds(trace_groups)
+    logger.info(f"After filtering: {len(filtered_elements):,} elements to insert")
+
+    # Phase 3: Insert filtered traces into database
+    logger.info("-" * 60)
+    logger.info("Phase 3: Inserting filtered traces into database...")
+
     conn = init_database()
     cursor = conn.cursor()
 
@@ -346,63 +466,48 @@ def process_jsonl(sample_size: int = 1000) -> dict:
     logger.info("Existing data cleared")
 
     processed_count = 0
-    error_count = 0
     prompt_counts = Counter()
     model_counts = Counter()
     batch_start_time = time.time()
 
-    logger.info(f"Starting to read and process traces...")
+    for element in filtered_elements:
+        trace_info = element['trace_info']
+        raw_trace = element['raw_trace']
 
-    with open(JSONL_FILE, 'r') as f:
-        for line in f:
-            if processed_count >= sample_size:
-                break
+        # Insert trace info
+        cursor.execute('''
+            INSERT OR REPLACE INTO traces VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            trace_info.element_id, trace_info.trace_id,
+            trace_info.created_at, trace_info.parsed_timestamp,
+            trace_info.model, trace_info.cost, trace_info.total_tokens,
+            trace_info.prompt_tokens, trace_info.completion_tokens, trace_info.response_time,
+            trace_info.system_prompt_hash, trace_info.system_prompt_file,
+            trace_info.num_messages, trace_info.num_turns,
+            1 if trace_info.has_tool_calls else 0,
+            1 if trace_info.has_metadata else 0,
+            trace_info.metadata_keys,
+            1 if trace_info.is_multi_turn else 0,
+            1 if trace_info.user_disagreement_detected else 0,
+            trace_info.potential_error_indicators
+        ))
 
-            try:
-                trace = json.loads(line)
-                trace_info = process_trace(trace)
+        # Store raw trace
+        cursor.execute('''
+            INSERT OR REPLACE INTO raw_traces VALUES (?, ?, ?)
+        ''', (trace_info.element_id, trace_info.trace_id, json.dumps(raw_trace)))
 
-                if trace_info:
-                    # Insert trace info (element_id as primary key)
-                    cursor.execute('''
-                        INSERT OR REPLACE INTO traces VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (
-                        trace_info.element_id, trace_info.trace_id,
-                        trace_info.created_at, trace_info.parsed_timestamp,
-                        trace_info.model, trace_info.cost, trace_info.total_tokens,
-                        trace_info.prompt_tokens, trace_info.completion_tokens, trace_info.response_time,
-                        trace_info.system_prompt_hash, trace_info.system_prompt_file,
-                        trace_info.num_messages, trace_info.num_turns,
-                        1 if trace_info.has_tool_calls else 0,
-                        1 if trace_info.has_metadata else 0,
-                        trace_info.metadata_keys,
-                        1 if trace_info.is_multi_turn else 0,
-                        1 if trace_info.user_disagreement_detected else 0,
-                        trace_info.potential_error_indicators
-                    ))
+        prompt_counts[trace_info.system_prompt_hash] += 1
+        model_counts[trace_info.model] += 1
+        processed_count += 1
 
-                    # Store raw trace for viewing (element_id as primary key)
-                    cursor.execute('''
-                        INSERT OR REPLACE INTO raw_traces VALUES (?, ?, ?)
-                    ''', (trace_info.element_id, trace_info.trace_id, json.dumps(trace)))
-
-                    prompt_counts[trace_info.system_prompt_hash] += 1
-                    model_counts[trace_info.model] += 1
-                    processed_count += 1
-                else:
-                    error_count += 1
-
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON decode error at trace {processed_count + error_count + 1}: {e}")
-                error_count += 1
-
-            if processed_count % 100 == 0 and processed_count > 0:
-                batch_elapsed = time.time() - batch_start_time
-                rate = 100 / batch_elapsed if batch_elapsed > 0 else 0
-                progress_pct = (processed_count / sample_size) * 100
-                logger.info(f"Progress: {processed_count:,}/{sample_size:,} ({progress_pct:.1f}%) - {rate:.0f} traces/sec")
-                conn.commit()
-                batch_start_time = time.time()
+        if processed_count % 1000 == 0:
+            batch_elapsed = time.time() - batch_start_time
+            rate = 1000 / batch_elapsed if batch_elapsed > 0 else 0
+            progress_pct = (processed_count / len(filtered_elements)) * 100
+            logger.info(f"Inserting: {processed_count:,}/{len(filtered_elements):,} ({progress_pct:.1f}%) - {rate:.0f} traces/sec")
+            conn.commit()
+            batch_start_time = time.time()
 
     # Update prompt counts
     logger.info("Saving prompt statistics...")
@@ -422,12 +527,16 @@ def process_jsonl(sample_size: int = 1000) -> dict:
     # Calculate final stats
     elapsed_time = time.time() - start_time
     avg_rate = processed_count / elapsed_time if elapsed_time > 0 else 0
+    elements_filtered = read_count - processed_count
 
     # Log summary
     logger.info(f"-" * 60)
     logger.info(f"PROCESSING COMPLETE")
     logger.info(f"-" * 60)
-    logger.info(f"Total traces processed: {processed_count:,}")
+    logger.info(f"Total elements read: {read_count:,}")
+    logger.info(f"Progressive builds filtered: {elements_filtered:,}")
+    logger.info(f"Final elements in DB: {processed_count:,}")
+    logger.info(f"Unique trace IDs: {len(trace_groups):,}")
     logger.info(f"Processing errors: {error_count:,}")
     logger.info(f"Unique system prompts: {len(prompt_counts)}")
     logger.info(f"Unique models: {len(model_counts)}")
@@ -453,6 +562,9 @@ def process_jsonl(sample_size: int = 1000) -> dict:
 
     return {
         'processed': processed_count,
+        'read': read_count,
+        'filtered': elements_filtered,
+        'unique_traces': len(trace_groups),
         'errors': error_count,
         'unique_prompts': len(prompt_counts),
         'elapsed_time': round(elapsed_time, 2),
