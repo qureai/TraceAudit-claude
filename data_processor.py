@@ -3,6 +3,8 @@ import hashlib
 import logging
 import time
 import os
+import csv
+import pickle
 from pathlib import Path
 from datetime import datetime
 from collections import Counter
@@ -11,6 +13,10 @@ from typing import Optional
 import sqlite3
 
 from config import JSONL_FILE, PROMPTS_DIR, PROCESSED_DIR, TRACES_DB
+
+# Path to CSV with use case info
+USE_CASE_CSV = Path(__file__).parent / "data" / "prompts_info_processed.csv"
+PICKLE_BASE_DIR = Path(__file__).parent / "data"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -298,7 +304,12 @@ def init_database():
             prompt_hash TEXT PRIMARY KEY,
             filename TEXT,
             trace_count INTEGER,
-            first_seen TEXT
+            first_seen TEXT,
+            use_case_name TEXT,
+            use_case_version TEXT,
+            use_case_type TEXT,
+            workspace TEXT,
+            model_config TEXT
         )
     ''')
 
@@ -314,6 +325,137 @@ def init_database():
     conn.commit()
     logger.info("Database schema created successfully")
     return conn
+
+
+def build_use_case_mapping() -> dict:
+    """
+    Build a mapping from system_prompt_hash to use case info by loading
+    pickle files referenced in the CSV.
+
+    Returns dict: {prompt_hash: {'name': str, 'version': str, 'type': str, 'workspace': str}}
+    """
+    mapping = {}
+
+    if not USE_CASE_CSV.exists():
+        logger.warning(f"Use case CSV not found: {USE_CASE_CSV}")
+        return mapping
+
+    logger.info(f"Loading use case mapping from {USE_CASE_CSV}")
+
+    with open(USE_CASE_CSV, 'r') as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    logger.info(f"Found {len(rows)} use cases in CSV")
+    loaded = 0
+    errors = 0
+
+    for row in rows:
+        pkl_path = PICKLE_BASE_DIR / row['path']
+
+        if not pkl_path.exists():
+            logger.debug(f"Pickle file not found: {pkl_path}")
+            errors += 1
+            continue
+
+        try:
+            with open(pkl_path, 'rb') as f:
+                data = pickle.load(f)
+
+            system_prompt = data.get('system_prompt', '')
+            if not system_prompt:
+                continue
+
+            # Compute hash the same way as in process_trace
+            prompt_hash = hashlib.md5(system_prompt.encode()).hexdigest()[:16]
+
+            # Parse workspace list - join all workspaces
+            workspace = row.get('workspace_list', '[]')
+            try:
+                workspace_list = eval(workspace)
+                workspace = ', '.join(workspace_list) if workspace_list else ''
+            except:
+                workspace = ''
+
+            # Parse type list - join all types
+            type_str = row.get('type_list', '[]')
+            try:
+                type_list = eval(type_str)
+                use_case_type = ', '.join(type_list) if type_list else ''
+            except:
+                use_case_type = ''
+
+            # Parse model config list - extract unique models
+            model_str = row.get('model_config_list', '[]')
+            try:
+                model_list = eval(model_str)
+                models = list(set(m.get('model', '') for m in model_list if m.get('model')))
+                model_config = ', '.join(models) if models else ''
+            except:
+                model_config = ''
+
+            # If hash already exists (same system prompt from different CSV rows), merge data
+            if prompt_hash in mapping:
+                existing = mapping[prompt_hash]
+
+                # Merge workspaces
+                existing_workspaces = set(w.strip() for w in existing['workspace'].split(',') if w.strip())
+                new_workspaces = set(w.strip() for w in workspace.split(',') if w.strip())
+                merged_workspaces = ', '.join(sorted(existing_workspaces | new_workspaces))
+
+                # Merge types
+                existing_types = set(t.strip() for t in existing['type'].split(',') if t.strip())
+                new_types = set(t.strip() for t in use_case_type.split(',') if t.strip())
+                merged_types = ', '.join(sorted(existing_types | new_types))
+
+                # Merge models
+                existing_models = set(m.strip() for m in existing.get('model_config', '').split(',') if m.strip())
+                new_models = set(m.strip() for m in model_config.split(',') if m.strip())
+                merged_models = ', '.join(sorted(existing_models | new_models))
+
+                mapping[prompt_hash] = {
+                    'name': existing['name'],  # Keep existing name
+                    'version': existing['version'],  # Keep existing version
+                    'type': merged_types,
+                    'workspace': merged_workspaces,
+                    'model_config': merged_models
+                }
+                logger.debug(f"Merged data for {existing['name']} (hash: {prompt_hash})")
+            else:
+                mapping[prompt_hash] = {
+                    'name': row['use_case'],
+                    'version': row['version'],
+                    'type': use_case_type,
+                    'workspace': workspace,
+                    'model_config': model_config
+                }
+            loaded += 1
+
+        except Exception as e:
+            logger.debug(f"Error loading {pkl_path}: {e}")
+            errors += 1
+
+    logger.info(f"Loaded {loaded} use case mappings ({errors} errors/missing)")
+    return mapping
+
+
+def update_prompts_with_use_cases(conn, use_case_mapping: dict):
+    """Update the prompts table with use case names from the mapping."""
+    cursor = conn.cursor()
+
+    updated = 0
+    for prompt_hash, info in use_case_mapping.items():
+        cursor.execute('''
+            UPDATE prompts
+            SET use_case_name = ?, use_case_version = ?, use_case_type = ?, workspace = ?, model_config = ?
+            WHERE prompt_hash = ?
+        ''', (info['name'], info['version'], info['type'], info['workspace'], info.get('model_config', ''), prompt_hash))
+
+        if cursor.rowcount > 0:
+            updated += 1
+
+    conn.commit()
+    logger.info(f"Updated {updated} prompts with use case names")
 
 
 def is_progressive_build(elements: list) -> bool:
@@ -518,6 +660,13 @@ def process_jsonl(sample_size: int = 1000) -> dict:
         ''', (prompt_hash, f"prompt_{prompt_hash}.txt", count))
 
     conn.commit()
+
+    # Build use case mapping from CSV/pickle files and update prompts table
+    logger.info("-" * 60)
+    logger.info("Phase 4: Matching prompts to use case names...")
+    use_case_mapping = build_use_case_mapping()
+    if use_case_mapping:
+        update_prompts_with_use_cases(conn, use_case_mapping)
 
     # Get final database size
     db_size = os.path.getsize(TRACES_DB) if os.path.exists(TRACES_DB) else 0

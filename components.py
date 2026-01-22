@@ -1,6 +1,25 @@
 from fasthtml.common import *
 import json
 import re
+from datetime import datetime
+
+
+def format_date(date_str: str) -> str:
+    """Format date to YYYY-MM-DD HH:MM:SS format."""
+    if not date_str or date_str == 'Unknown' or date_str == 'N/A':
+        return date_str or 'N/A'
+    try:
+        # Try parsing ISO format
+        if 'T' in date_str:
+            dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+        else:
+            dt = datetime.fromisoformat(date_str)
+        return dt.strftime('%Y-%m-%d %H:%M:%S')
+    except (ValueError, TypeError):
+        # If parsing fails, try to extract just the date/time portion
+        if len(date_str) >= 19:
+            return date_str[:19].replace('T', ' ')
+        return date_str
 
 
 def format_content(content: str) -> NotStr:
@@ -21,44 +40,125 @@ def StatCard(title: str, value, subtitle: str = None, color: str = "#3b82f6"):
     )
 
 
-def ModelDistributionChart(model_distribution: dict):
-    total = sum(model_distribution.values())
-    bars = []
-    colors = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899']
-    for i, (model, count) in enumerate(model_distribution.items()):
+def PieChart(data: dict, title: str, chart_id: str):
+    """Create a pie chart using CSS conic-gradient."""
+    total = sum(data.values())
+    colors = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16']
+
+    # Build conic gradient
+    gradient_parts = []
+    cumulative = 0
+    legend_items = []
+
+    for i, (label, count) in enumerate(data.items()):
         pct = (count / total * 100) if total > 0 else 0
         color = colors[i % len(colors)]
-        bars.append(
+        start_pct = cumulative
+        cumulative += pct
+        gradient_parts.append(f"{color} {start_pct}% {cumulative}%")
+
+        # Short label for display
+        short_label = label.split('/')[-1] if '/' in label else label
+        if len(short_label) > 20:
+            short_label = short_label[:17] + "..."
+
+        legend_items.append(
             Div(
+                Div(style=f"width: 12px; height: 12px; background: {color}; border-radius: 2px; flex-shrink: 0;"),
                 Div(
-                    Div(style=f"width: {pct}%; background: {color}; height: 100%; border-radius: 4px;"),
-                    style="flex: 1; background: #0f0f1a; border-radius: 4px; height: 24px; overflow: hidden;"
+                    Div(short_label, style="font-size: 0.8em; color: #e2e8f0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"),
+                    Div(f"{count:,} ({pct:.1f}%)", style="font-size: 0.7em; color: #64748b;"),
+                    style="flex: 1; min-width: 0;"
                 ),
-                Div(f"{model.split('/')[-1]}", style="min-width: 150px; font-size: 0.85em; color: #e2e8f0;"),
-                Div(f"{count:,} ({pct:.1f}%)", style="min-width: 120px; text-align: right; font-size: 0.85em; color: #94a3b8;"),
-                style="display: flex; align-items: center; gap: 12px; margin-bottom: 8px;"
+                style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px;"
             )
         )
+
+    gradient = ", ".join(gradient_parts) if gradient_parts else "#2d3748 0% 100%"
+
     return Div(
-        H3("Model Distribution", style="margin-bottom: 16px; color: #e2e8f0;"),
-        *bars,
-        style="background: #1f2940; padding: 20px; border-radius: 12px; border: 1px solid #2d3748;"
+        H4(title, style="margin-bottom: 12px; color: #e2e8f0; font-size: 0.95em;"),
+        Div(
+            # Pie chart
+            Div(
+                style=f"width: 140px; height: 140px; border-radius: 50%; background: conic-gradient({gradient}); flex-shrink: 0;"
+            ),
+            # Legend
+            Div(
+                *legend_items,
+                style="flex: 1; max-height: 160px; overflow-y: auto;"
+            ),
+            style="display: flex; gap: 16px; align-items: center;"
+        ),
+        style="background: #16213e; padding: 16px; border-radius: 8px; flex: 1;"
     )
 
 
+def ModelDistributionChart(model_distribution: dict):
+    return PieChart(model_distribution, "Model Distribution", "model-pie")
+
+
+def UseCaseDistributionChart(use_case_distribution: dict):
+    """Create a pie chart for use case distribution."""
+    # Convert to simple count dict using actual use case names
+    simple_data = {}
+    for hash_val, info in list(use_case_distribution.items())[:8]:  # Top 8 use cases
+        # Use actual use case name if available, otherwise fallback to hash prefix
+        use_case_name = info.get('use_case_name')
+        if use_case_name:
+            # Truncate long names for the chart
+            label = use_case_name[:20] + "..." if len(use_case_name) > 20 else use_case_name
+        else:
+            label = f"{hash_val[:8]}..."
+        simple_data[label] = info['count']
+    return PieChart(simple_data, "Use Case Distribution", "usecase-pie")
+
+
 def UseCaseCard(prompt_hash: str, info: dict, index: int):
+    # Use actual use case name if available
+    use_case_name = info.get('use_case_name')
+    title = use_case_name if use_case_name else f"Use Case #{index + 1}"
+
+    # Type badges - create separate badge for each type
+    use_case_type = info.get('use_case_type', '')
+    type_badges = []
+    type_colors = {'workflows': '#8b5cf6', 'agents': '#10b981', 'prompts': '#f59e0b'}
+    if use_case_type:
+        for t in use_case_type.split(', '):
+            t = t.strip()
+            if t:
+                color = type_colors.get(t, '#6b7280')
+                type_badges.append(
+                    Span(t, style=f"background: {color}; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.7em;")
+                )
+
+    # Version badge
+    version = info.get('use_case_version', '')
+    version_badge = None
+    if version:
+        version_badge = Span(version, style="background: #374151; color: #d1d5db; padding: 2px 8px; border-radius: 4px; font-size: 0.7em;")
+
+    # Workspace info
+    workspace = info.get('workspace', '')
+
     return A(
         Div(
             Div(
-                Div(f"Use Case #{index + 1}", style="font-weight: 600; color: #e2e8f0; margin-bottom: 8px;"),
+                Div(
+                    Span(title, style="font-weight: 600; color: #e2e8f0;"),
+                    *type_badges,
+                    version_badge,
+                    style="display: flex; align-items: center; margin-bottom: 8px; flex-wrap: wrap; gap: 4px;"
+                ),
                 Div(f"{info['count']:,} traces", style="font-size: 1.2em; font-weight: 700; color: #3b82f6;"),
                 style="flex: 1;"
             ),
             Div(
                 Div(info['description'][:80] + "..." if len(info.get('description', '')) > 80 else info.get('description', ''),
-                    style="font-size: 0.85em; color: #94a3b8; margin-top: 12px; line-height: 1.4;"),
-                Div(f"Primary model: {info.get('sample_model', 'N/A').split('/')[-1]}",
-                    style="font-size: 0.75em; color: #64748b; margin-top: 8px;"),
+                    style="font-size: 0.85em; color: #94a3b8; margin-top: 12px; line-height: 1.4;") if not use_case_name else None,
+                Div(f"Workspace: {workspace}", style="font-size: 0.75em; color: #64748b; margin-top: 8px;") if workspace else None,
+                Div(f"Model: {info.get('sample_model', 'N/A').split('/')[-1]}",
+                    style="font-size: 0.75em; color: #64748b; margin-top: 4px;"),
             ),
             style="padding: 20px;"
         ),
@@ -81,12 +181,12 @@ def TraceListItem(trace: dict, show_use_case: bool = False):
             style="margin-top: 8px;"
         )
 
-    # Multi-element badge
+    # Multi-trace badge
     element_count = trace.get('element_count', 1)
     multi_element_badge = None
     if element_count > 1:
         multi_element_badge = Span(
-            f"📦 {element_count} elements",
+            f"📦 {element_count} traces",
             style="background: #8b5cf6; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.7em; margin-left: 8px;"
         )
 
@@ -278,7 +378,7 @@ def NavBar(active: str = "dashboard"):
     links = [
         ("Dashboard", "/", "dashboard"),
         ("Use Cases", "/use-cases", "use-cases"),
-        ("Multi-Element", "/multi-element", "multi-element"),
+        ("Multi-Trace", "/multi-element", "multi-element"),
         ("Errors", "/errors", "errors"),
         ("All Traces", "/traces", "traces"),
     ]
@@ -304,20 +404,20 @@ def NavBar(active: str = "dashboard"):
 
 def MultiElementStatsPanel(stats: dict):
     return Div(
-        H3("📦 Multi-Element Traces", style="margin-bottom: 16px; color: #8b5cf6;"),
+        H3("📦 Multi-Trace Groups", style="margin-bottom: 16px; color: #8b5cf6;"),
         Div(
-            StatCard("Traces with Multiple Elements", stats.get('traces_with_multiple_elements', 0), color="#8b5cf6"),
-            StatCard("Max Elements/Trace", stats.get('max_elements_per_trace', 1), color="#ec4899"),
-            StatCard("Avg Elements/Trace", stats.get('avg_elements_per_trace', 1), color="#f59e0b"),
-            StatCard("Extra Elements", stats.get('total_extra_elements', 0), "Beyond unique trace IDs", "#6b7280"),
+            StatCard("Groups with Multiple Traces", stats.get('traces_with_multiple_elements', 0), color="#8b5cf6"),
+            StatCard("Max Traces/Group", stats.get('max_elements_per_trace', 1), color="#ec4899"),
+            StatCard("Avg Traces/Group", stats.get('avg_elements_per_trace', 1), color="#f59e0b"),
+            StatCard("Extra Traces", stats.get('total_extra_elements', 0), "Beyond unique trace IDs", "#6b7280"),
             style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px;"
         ),
-        A("View All Multi-Element Traces →", href="/multi-element", style="display: block; margin-top: 16px; color: #8b5cf6; text-decoration: none;"),
+        A("View All Multi-Trace Groups →", href="/multi-element", style="display: block; margin-top: 16px; color: #8b5cf6; text-decoration: none;"),
         style="background: #1f2940; padding: 20px; border-radius: 12px; border: 1px solid #2d3748;"
     )
 
 
-def FilterPanel(filters: dict, current_model: str = None, current_use_case: str = None, has_errors: bool = None, multi_element_only: bool = False):
+def FilterPanel(filters: dict, current_model: str = None, current_use_case: str = None, has_errors: bool = None, multi_element_only: bool = False, with_metadata: bool = None, multi_turn: bool = None):
     return Div(
         H4("Filters", style="margin-bottom: 12px; color: #e2e8f0;"),
         Form(
@@ -350,8 +450,22 @@ def FilterPanel(filters: dict, current_model: str = None, current_use_case: str 
             ),
             Div(
                 Label(
+                    Input(type="checkbox", name="with_metadata", value="true", checked=with_metadata, style="margin-right: 8px;"),
+                    Span("With Metadata", style="color: #94a3b8; font-size: 0.85em;"),
+                ),
+                style="margin-bottom: 12px;"
+            ),
+            Div(
+                Label(
+                    Input(type="checkbox", name="multi_turn", value="true", checked=multi_turn, style="margin-right: 8px;"),
+                    Span("Multi-turn", style="color: #94a3b8; font-size: 0.85em;"),
+                ),
+                style="margin-bottom: 12px;"
+            ),
+            Div(
+                Label(
                     Input(type="checkbox", name="multi_element_only", value="true", checked=multi_element_only, style="margin-right: 8px;"),
-                    Span("Multi-Element Only", style="color: #94a3b8; font-size: 0.85em;"),
+                    Span("Multi-Trace Only", style="color: #94a3b8; font-size: 0.85em;"),
                 ),
                 style="margin-bottom: 12px;"
             ),
@@ -365,15 +479,15 @@ def FilterPanel(filters: dict, current_model: str = None, current_use_case: str 
 
 
 def ElementCard(element: dict, index: int, total: int):
-    """Card for displaying a single trace element in a multi-element trace view."""
+    """Card for displaying a single trace in a multi-trace view."""
     return Div(
         Div(
             Div(
-                Span(f"Element {index + 1} of {total}", style="font-weight: 600; color: #e2e8f0;"),
+                Span(f"Trace {index + 1} of {total}", style="font-weight: 600; color: #e2e8f0;"),
                 Span(element.get('model', 'unknown').split('/')[-1], style="background: #3b82f6; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75em; margin-left: 12px;"),
                 style="display: flex; align-items: center;"
             ),
-            Div(element.get('created_at', 'N/A'), style="font-size: 0.8em; color: #64748b; margin-top: 4px;"),
+            Div(format_date(element.get('created_at', 'N/A')), style="font-size: 0.8em; color: #64748b; margin-top: 4px;"),
             style="flex: 1;"
         ),
         Div(
@@ -384,4 +498,51 @@ def ElementCard(element: dict, index: int, total: int):
         ),
         style="display: flex; justify-content: space-between; padding: 16px; background: #16213e; border-radius: 8px; border: 1px solid #2d3748; margin-bottom: 8px; cursor: pointer;",
         onclick=f"showElement({index})"
+    )
+
+
+def ErrorFilterPanel(filters: dict, current_model: str = None, current_use_case: str = None, error_type: str = None):
+    """Filter panel for the errors page."""
+    return Div(
+        H4("Filters", style="margin-bottom: 12px; color: #e2e8f0;"),
+        Form(
+            Div(
+                Label("Model:", style="color: #94a3b8; font-size: 0.85em;"),
+                Select(
+                    Option("All Models", value="", selected=not current_model),
+                    *[Option(m.split('/')[-1], value=m, selected=m == current_model) for m in filters.get('models', [])],
+                    name="model",
+                    style="width: 100%; padding: 8px; background: #0f0f1a; color: #e2e8f0; border: 1px solid #2d3748; border-radius: 4px;"
+                ),
+                style="margin-bottom: 12px;"
+            ),
+            Div(
+                Label("Use Case:", style="color: #94a3b8; font-size: 0.85em;"),
+                Select(
+                    Option("All Use Cases", value="", selected=not current_use_case),
+                    *[Option(f"{uc['hash'][:8]}... ({uc['count']})", value=uc['hash'], selected=uc['hash'] == current_use_case) for uc in filters.get('use_cases', [])],
+                    name="use_case",
+                    style="width: 100%; padding: 8px; background: #0f0f1a; color: #e2e8f0; border: 1px solid #2d3748; border-radius: 4px;"
+                ),
+                style="margin-bottom: 12px;"
+            ),
+            Div(
+                Label("Error Type:", style="color: #94a3b8; font-size: 0.85em;"),
+                Select(
+                    Option("All Errors", value="", selected=not error_type),
+                    Option("User Disagreements", value="user_disagreement", selected=error_type == "user_disagreement"),
+                    Option("Empty Response", value="empty_response", selected=error_type == "empty_response"),
+                    Option("Refusal", value="refusal", selected=error_type == "refusal"),
+                    Option("Error Status", value="error_status", selected=error_type == "error_status"),
+                    name="error_type",
+                    style="width: 100%; padding: 8px; background: #0f0f1a; color: #e2e8f0; border: 1px solid #2d3748; border-radius: 4px;"
+                ),
+                style="margin-bottom: 12px;"
+            ),
+            Button("Apply Filters", type="submit", style="width: 100%; padding: 10px; background: #3b82f6; color: white; border: none; border-radius: 6px; cursor: pointer;"),
+            A("Clear Filters", href="/errors", style="display: block; text-align: center; margin-top: 8px; color: #64748b; font-size: 0.85em;"),
+            method="get",
+            action="/errors"
+        ),
+        style="background: #1f2940; padding: 16px; border-radius: 12px; border: 1px solid #2d3748; margin-bottom: 16px;"
     )

@@ -102,39 +102,52 @@ def run_analysis() -> AnalysisResult:
     ''')
     model_distribution = {row[0]: row[1] for row in cursor.fetchall()}
 
-    # Use case distribution with prompt info
+    # Use case distribution with prompt info and use_case_name from prompts table
     cursor.execute('''
         SELECT t.system_prompt_hash, t.system_prompt_file, COUNT(*) as count,
-               t.model
+               t.model, p.use_case_name, p.use_case_version, p.use_case_type, p.workspace, p.model_config
         FROM traces t
+        LEFT JOIN prompts p ON t.system_prompt_hash = p.prompt_hash
         GROUP BY t.system_prompt_hash
         ORDER BY count DESC
     ''')
     use_case_rows = cursor.fetchall()
     use_case_distribution = {}
     for row in use_case_rows:
-        prompt_hash, filename, count, sample_model = row
-        # Load first 200 chars of prompt for description
-        prompt_path = PROMPTS_DIR / filename if filename else None
-        description = ""
-        if prompt_path and prompt_path.exists():
-            with open(prompt_path, 'r') as f:
-                content = f.read()
-                # Extract a meaningful title from the prompt
-                lines = content.split('\n')
-                for line in lines:
-                    line = line.strip()
-                    if line and not line.startswith('<') and not line.startswith('#'):
-                        description = line[:100]
-                        break
-                if not description:
-                    description = content[:100].replace('\n', ' ')
+        prompt_hash, filename, count, sample_model, use_case_name, use_case_version, use_case_type, workspace, model_config = row
+
+        # Use the matched use_case_name if available, otherwise extract from prompt file
+        if use_case_name:
+            description = use_case_name
+            if use_case_version:
+                description = f"{use_case_name} ({use_case_version})"
+        else:
+            # Fallback: Load first 200 chars of prompt for description
+            prompt_path = PROMPTS_DIR / filename if filename else None
+            description = ""
+            if prompt_path and prompt_path.exists():
+                with open(prompt_path, 'r') as f:
+                    content = f.read()
+                    # Extract a meaningful title from the prompt
+                    lines = content.split('\n')
+                    for line in lines:
+                        line = line.strip()
+                        if line and not line.startswith('<') and not line.startswith('#'):
+                            description = line[:100]
+                            break
+                    if not description:
+                        description = content[:100].replace('\n', ' ')
 
         use_case_distribution[prompt_hash] = {
             'filename': filename,
             'count': count,
             'description': description,
-            'sample_model': sample_model
+            'sample_model': sample_model,
+            'use_case_name': use_case_name,
+            'use_case_version': use_case_version,
+            'use_case_type': use_case_type,
+            'workspace': workspace,
+            'model_config': model_config
         }
 
     # Multi-turn stats
@@ -411,20 +424,78 @@ def get_system_prompt_content(prompt_hash: str) -> str:
     return "Prompt not found"
 
 
-def get_traces_with_errors(limit: int = 50) -> list[dict]:
-    """Get traces that have potential error indicators."""
+def get_use_case_info(prompt_hash: str) -> Optional[dict]:
+    """Get use case info including name, version, type, workspace, model_config by prompt hash."""
     conn = get_db_connection()
     cursor = conn.cursor()
 
     cursor.execute('''
+        SELECT prompt_hash, use_case_name, use_case_version, use_case_type, workspace, trace_count, model_config
+        FROM prompts
+        WHERE prompt_hash = ?
+    ''', (prompt_hash,))
+
+    row = cursor.fetchone()
+    conn.close()
+
+    if row:
+        return {
+            'prompt_hash': row[0],
+            'use_case_name': row[1],
+            'use_case_version': row[2],
+            'use_case_type': row[3],
+            'workspace': row[4],
+            'trace_count': row[5],
+            'model_config': row[6]
+        }
+    return None
+
+
+def get_traces_with_errors(
+    limit: int = 50,
+    model: str = None,
+    use_case: str = None,
+    error_type: str = None
+) -> list[dict]:
+    """Get traces that have potential error indicators."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Build WHERE clause
+    conditions = ["(potential_error_indicators != '' OR user_disagreement_detected = 1)"]
+    params = []
+
+    if model:
+        conditions.append('model = ?')
+        params.append(model)
+
+    if use_case:
+        conditions.append('system_prompt_hash = ?')
+        params.append(use_case)
+
+    if error_type:
+        if error_type == 'user_disagreement':
+            conditions.append('user_disagreement_detected = 1')
+        elif error_type == 'empty_response':
+            conditions.append("potential_error_indicators LIKE '%empty_response%'")
+        elif error_type == 'refusal':
+            conditions.append("potential_error_indicators LIKE '%refusal%'")
+        elif error_type == 'error_status':
+            conditions.append("potential_error_indicators LIKE '%error_status%'")
+
+    where_clause = f"WHERE {' AND '.join(conditions)}"
+
+    sql = f'''
         SELECT element_id, trace_id, model, system_prompt_hash, num_turns,
                potential_error_indicators, user_disagreement_detected, created_at,
                (SELECT COUNT(*) FROM traces t2 WHERE t2.trace_id = traces.trace_id) as element_count
         FROM traces
-        WHERE potential_error_indicators != '' OR user_disagreement_detected = 1
+        {where_clause}
         ORDER BY parsed_timestamp DESC
         LIMIT ?
-    ''', (limit,))
+    '''
+
+    cursor.execute(sql, params + [limit])
 
     traces = []
     for row in cursor.fetchall():
@@ -481,7 +552,9 @@ def get_filtered_traces(
     model: str = None,
     use_case: str = None,
     has_errors: bool = None,
-    multi_element_only: bool = False
+    multi_element_only: bool = False,
+    with_metadata: bool = None,
+    multi_turn: bool = None
 ) -> tuple[list[dict], int]:
     """Get filtered list of traces with pagination."""
     conn = get_db_connection()
@@ -501,6 +574,12 @@ def get_filtered_traces(
 
     if has_errors:
         conditions.append("(potential_error_indicators != '' OR user_disagreement_detected = 1)")
+
+    if with_metadata:
+        conditions.append('has_metadata = 1')
+
+    if multi_turn:
+        conditions.append('is_multi_turn = 1')
 
     where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
@@ -602,11 +681,18 @@ def get_model_stats_by_use_case() -> dict:
     conn = get_db_connection()
     cursor = conn.cursor()
 
+    # Normalize model names by stripping provider prefix (e.g., "google/gemini-2.5-flash" -> "gemini-2.5-flash")
     cursor.execute('''
-        SELECT system_prompt_hash, model, COUNT(*) as count,
-               AVG(cost) as avg_cost, AVG(response_time) as avg_response_time
+        SELECT system_prompt_hash,
+               CASE WHEN INSTR(model, '/') > 0
+                    THEN SUBSTR(model, INSTR(model, '/') + 1)
+                    ELSE model
+               END as normalized_model,
+               COUNT(*) as count,
+               AVG(cost) as avg_cost,
+               AVG(response_time) as avg_response_time
         FROM traces
-        GROUP BY system_prompt_hash, model
+        GROUP BY system_prompt_hash, normalized_model
         ORDER BY system_prompt_hash, count DESC
     ''')
 

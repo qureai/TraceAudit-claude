@@ -49,3 +49,6 @@ data/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Backup files
+pre-compact-backups/

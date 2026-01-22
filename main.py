@@ -15,12 +15,12 @@ from analyzer import (
     run_analysis, get_random_traces_for_use_case, get_trace_detail,
     get_system_prompt_content, get_traces_with_errors, get_model_stats_by_use_case,
     get_traces_with_multiple_elements, get_filtered_traces, get_available_filters,
-    get_element_detail
+    get_element_detail, get_use_case_info
 )
 from components import (
-    StatCard, ModelDistributionChart, UseCaseCard, TraceListItem,
+    StatCard, ModelDistributionChart, UseCaseDistributionChart, UseCaseCard, TraceListItem,
     MessageBubble, ErrorDetectionPanel, MetadataStatsPanel, TokenCostPanel, NavBar,
-    MultiElementStatsPanel, FilterPanel
+    MultiElementStatsPanel, FilterPanel, ErrorFilterPanel, format_date
 )
 
 logging.basicConfig(
@@ -284,6 +284,11 @@ def get():
             )
         )
 
+    # Format time period for display with highlighting
+    time_start = format_date(analysis.time_period_start) if analysis.time_period_start != 'Unknown' else 'Unknown'
+    time_end = format_date(analysis.time_period_end) if analysis.time_period_end != 'Unknown' else 'Unknown'
+    time_span = f"{analysis.time_span_days:.0f}" if analysis.time_span_days else "N/A"
+
     return Div(
         NavBar("dashboard"),
         Div(
@@ -291,8 +296,15 @@ def get():
                 Div(
                     Div(
                         H2("📊 TraceAudit Dashboard", style="margin: 0;"),
-                        P(f"Analyzing {analysis.total_elements:,} elements ({analysis.unique_trace_ids:,} unique traces) from {analysis.time_period_start[:10] if analysis.time_period_start != 'Unknown' else 'Unknown'} to {analysis.time_period_end[:10] if analysis.time_period_end != 'Unknown' else 'Unknown'}",
-                          style="margin: 4px 0 0 0; color: #94a3b8;"),
+                        P(
+                            Span(f"Analyzing {analysis.total_elements:,} traces ({analysis.unique_trace_ids:,} unique) from "),
+                            Span(time_start, style="color: #3b82f6; font-weight: 600;"),
+                            Span(" to "),
+                            Span(time_end, style="color: #3b82f6; font-weight: 600;"),
+                            Span(" · "),
+                            Span(f"{time_span} days", style="color: #10b981; font-weight: 600;"),
+                            style="margin: 4px 0 0 0; color: #94a3b8;"
+                        ),
                     ),
                     Form(
                         Button(
@@ -307,23 +319,21 @@ def get():
                 ),
                 cls="section-header"
             ),
-            # Top stats
+            # Top stats - Unique traces first, total traces last
             Div(
-                StatCard("Total Elements", f"{analysis.total_elements:,}", f"{analysis.unique_trace_ids:,} unique traces", "#3b82f6"),
+                StatCard("Unique Traces", f"{analysis.unique_trace_ids:,}", color="#3b82f6"),
                 StatCard("Unique Use Cases", analysis.unique_use_cases, color="#10b981"),
                 StatCard("Multi-turn", analysis.multi_turn_stats['multi_turn_count'], f"{analysis.multi_turn_stats['avg_turns']:.1f} avg turns", "#8b5cf6"),
-                StatCard("With Tool Calls", analysis.tool_call_stats['with_tool_calls'], color="#f59e0b"),
-                StatCard("Time Span", f"{analysis.time_span_days:.1f} days" if analysis.time_span_days else "N/A", color="#ec4899"),
+                StatCard("With Metadata", analysis.metadata_stats.get('with_metadata', 0), color="#f59e0b"),
+                StatCard("Total Traces", f"{analysis.total_elements:,}", color="#6b7280"),
                 cls="stats-grid"
             ),
-            # Model distribution
-            ModelDistributionChart(analysis.model_distribution),
-            # Multi-element stats panel
-            Div(style="margin-top: 24px;"),
-            MultiElementStatsPanel(analysis.multi_element_stats),
-            # Token/Cost metrics
-            Div(style="margin-top: 24px;"),
-            TokenCostPanel(analysis.token_stats, analysis.cost_stats, analysis.response_time_stats),
+            # Model and Use Case distribution pie charts side by side
+            Div(
+                ModelDistributionChart(analysis.model_distribution),
+                UseCaseDistributionChart(analysis.use_case_distribution),
+                style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-top: 24px; background: #1f2940; padding: 20px; border-radius: 12px; border: 1px solid #2d3748;"
+            ),
             # Two column layout for error and metadata
             Div(
                 ErrorDetectionPanel(analysis.error_detection_stats),
@@ -346,9 +356,89 @@ def get():
 
 
 @rt('/use-cases')
-def get():
-    logger.info("Loading use cases page")
+def get(type_filter: str = None):
+    logger.info(f"Loading use cases page with type_filter={type_filter}")
     analysis = run_analysis()
+
+    # Get all unique types for filter dropdown and count matched/unmatched
+    all_types = set()
+    unmatched_count = 0
+    matched_count = 0
+    for info in analysis.use_case_distribution.values():
+        if info.get('use_case_type'):
+            # Split comma-separated types and add each individually
+            for t in info['use_case_type'].split(', '):
+                if t.strip():
+                    all_types.add(t.strip())
+        if not info.get('use_case_name'):
+            unmatched_count += 1
+        else:
+            matched_count += 1
+    all_types = sorted(all_types)
+
+    # Filter use cases by type if filter is set
+    filtered_use_cases = {}
+    for hash_val, info in analysis.use_case_distribution.items():
+        if type_filter == 'unmatched':
+            # Show only unmatched (no use_case_name)
+            if not info.get('use_case_name'):
+                filtered_use_cases[hash_val] = info
+        elif type_filter == 'matched':
+            # Show only matched (has use_case_name)
+            if info.get('use_case_name'):
+                filtered_use_cases[hash_val] = info
+        elif type_filter and type_filter != 'all':
+            # Filter by type - check if the filter type is in the comma-separated list
+            use_case_types = [t.strip() for t in (info.get('use_case_type') or '').split(', ') if t.strip()]
+            if type_filter in use_case_types:
+                filtered_use_cases[hash_val] = info
+        else:
+            filtered_use_cases[hash_val] = info
+
+    # Type filter buttons
+    type_colors = {'workflows': '#8b5cf6', 'agents': '#10b981', 'prompts': '#f59e0b'}
+    type_buttons = [
+        A(
+            "All",
+            href="/use-cases",
+            style=f"padding: 8px 16px; border-radius: 6px; text-decoration: none; color: {'white' if not type_filter or type_filter == 'all' else '#94a3b8'}; background: {'#3b82f6' if not type_filter or type_filter == 'all' else '#1f2940'}; font-weight: {'600' if not type_filter or type_filter == 'all' else '400'};"
+        )
+    ]
+    for t in all_types:
+        color = type_colors.get(t, '#6b7280')
+        is_active = type_filter == t
+        type_buttons.append(
+            A(
+                t.capitalize(),
+                href=f"/use-cases?type_filter={t}",
+                style=f"padding: 8px 16px; border-radius: 6px; text-decoration: none; color: {'white' if is_active else '#94a3b8'}; background: {color if is_active else '#1f2940'}; font-weight: {'600' if is_active else '400'};"
+            )
+        )
+    # Add Matched filter button
+    is_matched_active = type_filter == 'matched'
+    type_buttons.append(
+        A(
+            f"Matched ({matched_count})",
+            href="/use-cases?type_filter=matched",
+            style=f"padding: 8px 16px; border-radius: 6px; text-decoration: none; color: {'white' if is_matched_active else '#94a3b8'}; background: {'#22c55e' if is_matched_active else '#1f2940'}; font-weight: {'600' if is_matched_active else '400'};"
+        )
+    )
+    # Add Unmatched filter button
+    is_unmatched_active = type_filter == 'unmatched'
+    type_buttons.append(
+        A(
+            f"Unmatched ({unmatched_count})",
+            href="/use-cases?type_filter=unmatched",
+            style=f"padding: 8px 16px; border-radius: 6px; text-decoration: none; color: {'white' if is_unmatched_active else '#94a3b8'}; background: {'#dc2626' if is_unmatched_active else '#1f2940'}; font-weight: {'600' if is_unmatched_active else '400'};"
+        )
+    )
+
+    # Build filter description
+    filter_desc = ""
+    if type_filter == 'unmatched':
+        filter_desc = " (unmatched use cases)"
+    elif type_filter and type_filter != 'all':
+        filter_desc = f" (filtered by: {type_filter})"
 
     return Div(
         NavBar("use-cases"),
@@ -356,12 +446,20 @@ def get():
             A("← Back to Dashboard", href="/", cls="back-link"),
             Div(
                 H2("🎯 Use Cases", style="margin: 0;"),
-                P(f"{analysis.unique_use_cases} unique system prompts identified", style="margin: 4px 0 0 0; color: #94a3b8;"),
+                P(f"{len(filtered_use_cases)} of {analysis.unique_use_cases} use cases{filter_desc}", style="margin: 4px 0 0 0; color: #94a3b8;"),
                 cls="section-header"
             ),
+            # Type filter
             Div(
-                *[UseCaseCard(hash, info, i) for i, (hash, info) in enumerate(analysis.use_case_distribution.items())],
+                Span("Filter by type:", style="color: #94a3b8; margin-right: 12px;"),
+                *type_buttons,
+                style="display: flex; align-items: center; gap: 8px; margin-bottom: 24px; flex-wrap: wrap;"
+            ),
+            Div(
+                *[UseCaseCard(hash, info, i) for i, (hash, info) in enumerate(filtered_use_cases.items())],
                 cls="use-case-grid"
+            ) if filtered_use_cases else Div(
+                P("No use cases found for this filter", style="color: #64748b; text-align: center; padding: 40px;")
             ),
             cls="main-container"
         )
@@ -379,13 +477,49 @@ def get(prompt_hash: str):
     # Get model stats for this use case
     model_stats = get_model_stats_by_use_case().get(prompt_hash, [])
 
+    # Get use case info (name, type, workspace, version)
+    use_case_info = get_use_case_info(prompt_hash)
+    use_case_name = use_case_info.get('use_case_name') if use_case_info else None
+    use_case_type = use_case_info.get('use_case_type') if use_case_info else None
+    use_case_version = use_case_info.get('use_case_version') if use_case_info else None
+    workspace = use_case_info.get('workspace') if use_case_info else None
+
+    # Build title
+    title = use_case_name if use_case_name else f"Use Case: {prompt_hash[:8]}..."
+
+    # Type badges - create separate badge for each type
+    type_badges = []
+    type_colors = {'workflows': '#8b5cf6', 'agents': '#10b981', 'prompts': '#f59e0b'}
+    if use_case_type:
+        for t in use_case_type.split(', '):
+            t = t.strip()
+            if t:
+                color = type_colors.get(t, '#6b7280')
+                type_badges.append(
+                    Span(t, style=f"background: {color}; color: white; padding: 4px 12px; border-radius: 4px; font-size: 0.8em;")
+                )
+
+    # Version badge
+    version_badge = None
+    if use_case_version:
+        version_badge = Span(use_case_version, style="background: #374151; color: #d1d5db; padding: 4px 12px; border-radius: 4px; font-size: 0.8em;")
+
     return Div(
         NavBar("use-cases"),
         Div(
             A("← Back to Use Cases", href="/use-cases", cls="back-link"),
             Div(
-                H2(f"Use Case: {prompt_hash[:8]}...", style="margin: 0;"),
-                P(f"{len(traces)} sample traces loaded", style="margin: 4px 0 0 0; color: #94a3b8;"),
+                Div(
+                    H2(title, style="margin: 0; display: inline;"),
+                    *type_badges,
+                    version_badge,
+                    style="display: flex; align-items: center; flex-wrap: wrap; gap: 8px;"
+                ),
+                P(
+                    Span(f"{len(traces)} sample traces loaded"),
+                    Span(f" · Workspace: {workspace}", style="color: #64748b;") if workspace else None,
+                    style="margin: 4px 0 0 0; color: #94a3b8;"
+                ),
                 cls="section-header"
             ),
             Div(
@@ -481,6 +615,10 @@ def get(trace_id: str, element_idx: int = 0):
     # Get system prompt
     system_prompt = get_system_prompt_content(trace_detail.get('system_prompt_hash', ''))
 
+    # Get use case info
+    use_case_info = get_use_case_info(trace_detail.get('system_prompt_hash', ''))
+    use_case_name = use_case_info.get('use_case_name') if use_case_info else None
+
     # Calculate turn numbers
     turn_numbers = {}
     current_turn = 0
@@ -499,7 +637,7 @@ def get(trace_id: str, element_idx: int = 0):
                          turn_number=turn_numbers.get(idx))
         )
 
-    # Element selector if multiple elements
+    # Trace selector if multiple traces
     element_selector = None
     if element_count > 1:
         element_tabs = []
@@ -507,16 +645,16 @@ def get(trace_id: str, element_idx: int = 0):
             is_active = i == element_idx
             element_tabs.append(
                 A(
-                    f"Element {i + 1}",
-                    Span(el.get('created_at', '')[:19] if el.get('created_at') else '', style="display: block; font-size: 0.7em; color: #64748b;"),
+                    f"Trace {i + 1}",
+                    Span(format_date(el.get('created_at', '')), style="display: block; font-size: 0.7em; color: #64748b;"),
                     href=f"/trace/{trace_id}?element_idx={i}",
                     style=f"padding: 12px 16px; background: {'#3b82f6' if is_active else '#1f2940'}; color: {'white' if is_active else '#94a3b8'}; border-radius: 8px; text-decoration: none; text-align: center; min-width: 100px;"
                 )
             )
         element_selector = Div(
             Div(
-                Span(f"📦 {element_count} Elements", style="font-weight: 600; color: #8b5cf6; margin-right: 16px;"),
-                Span("This trace has multiple elements - click to view each one", style="color: #64748b; font-size: 0.85em;"),
+                Span(f"📦 {element_count} Traces", style="font-weight: 600; color: #8b5cf6; margin-right: 16px;"),
+                Span("This trace ID has multiple traces - click to view each one", style="color: #64748b; font-size: 0.85em;"),
                 style="margin-bottom: 12px;"
             ),
             Div(*element_tabs, style="display: flex; gap: 8px; flex-wrap: wrap;"),
@@ -530,11 +668,13 @@ def get(trace_id: str, element_idx: int = 0):
             Div(
                 H2(f"Trace: {trace_id[:16]}...", style="margin: 0;"),
                 Div(
+                    A(use_case_name, href=f"/use-case/{trace_detail.get('system_prompt_hash', '')}",
+                      style="background: #10b981; color: white; padding: 4px 12px; border-radius: 4px; font-size: 0.85em; margin-right: 12px; text-decoration: none;") if use_case_name else Span(f"Use Case: {trace_detail.get('system_prompt_hash', '')[:8]}...", style="background: #6b7280; color: white; padding: 4px 12px; border-radius: 4px; font-size: 0.85em; margin-right: 12px;"),
                     Span(f"Model: {model}", style="background: #3b82f6; color: white; padding: 4px 12px; border-radius: 4px; font-size: 0.85em; margin-right: 12px;"),
                     Span(f"{current_element.get('num_turns', 0)} turns", style="color: #94a3b8; margin-right: 12px;"),
                     Span(f"${current_element.get('cost', 0):.4f}", style="color: #10b981; margin-right: 12px;"),
                     Span(f"{current_element.get('total_tokens', 0):,} tokens", style="color: #8b5cf6;"),
-                    Span(f"📦 Element {element_idx + 1}/{element_count}", style="margin-left: 12px; color: #8b5cf6;") if element_count > 1 else None,
+                    Span(f"📦 Trace {element_idx + 1}/{element_count}", style="margin-left: 12px; color: #8b5cf6;") if element_count > 1 else None,
                     style="margin-top: 8px;"
                 ),
                 cls="section-header"
@@ -558,9 +698,10 @@ def get(trace_id: str, element_idx: int = 0):
                     ),
                     # Trace metadata
                     Div(
-                        H4("Element Metadata", style="margin-bottom: 12px; color: #94a3b8; font-size: 0.85em;"),
-                        Div(f"Element ID: {current_element.get('element_id', 'N/A')[:16]}...", style="font-size: 0.85em; color: #64748b; margin-bottom: 4px;"),
-                        Div(f"Created: {current_element.get('created_at', 'N/A')}", style="font-size: 0.85em; color: #64748b; margin-bottom: 4px;"),
+                        H4("Trace Metadata", style="margin-bottom: 12px; color: #94a3b8; font-size: 0.85em;"),
+                        Div(f"Use Case: {use_case_name or 'Unknown'}", style="font-size: 0.85em; color: #10b981; margin-bottom: 4px; font-weight: 600;"),
+                        Div(f"Trace ID: {current_element.get('element_id', 'N/A')[:16]}...", style="font-size: 0.85em; color: #64748b; margin-bottom: 4px;"),
+                        Div(f"Created: {format_date(current_element.get('created_at', 'N/A'))}", style="font-size: 0.85em; color: #64748b; margin-bottom: 4px;"),
                         Div(f"Response Time: {current_element.get('response_time', 0)}ms", style="font-size: 0.85em; color: #64748b; margin-bottom: 4px;"),
                         Div(f"Has Tool Calls: {'Yes' if current_element.get('has_tool_calls') else 'No'}", style="font-size: 0.85em; color: #64748b; margin-bottom: 4px;"),
                         Div(f"Error Indicators: {current_element.get('potential_error_indicators') or 'None'}", style=f"font-size: 0.85em; color: {'#f87171' if current_element.get('potential_error_indicators') else '#64748b'}; margin-bottom: 4px;"),
@@ -592,11 +733,12 @@ def get(trace_id: str, element_idx: int = 0):
 
 
 @rt('/errors')
-def get():
-    logger.info("Loading errors page")
+def get(model: str = None, use_case: str = None, error_type: str = None):
+    logger.info(f"Loading errors page with filters: model={model}, use_case={use_case}, error_type={error_type}")
 
-    traces = get_traces_with_errors(limit=100)
+    traces = get_traces_with_errors(limit=100, model=model, use_case=use_case, error_type=error_type)
     analysis = run_analysis()
+    filters = get_available_filters()
 
     return Div(
         NavBar("errors"),
@@ -629,13 +771,22 @@ def get():
             ),
             # Error stats
             ErrorDetectionPanel(analysis.error_detection_stats),
-            # Trace list
+            # Filter panel and trace list side by side
             Div(
-                H3("Flagged Traces", style="margin: 24px 0 16px 0; color: #e2e8f0;"),
-                *[TraceListItem(trace, show_use_case=True) for trace in traces],
-                style="max-height: 600px; overflow-y: auto;"
-            ) if traces else Div(
-                P("No traces with errors found", style="color: #64748b; text-align: center; padding: 40px;")
+                # Filter panel on the left
+                Div(
+                    ErrorFilterPanel(filters, current_model=model, current_use_case=use_case, error_type=error_type),
+                    style="width: 280px; flex-shrink: 0;"
+                ),
+                # Trace list on the right
+                Div(
+                    H3("Flagged Traces", style="margin-bottom: 16px; color: #e2e8f0;"),
+                    *[TraceListItem(trace, show_use_case=True) for trace in traces] if traces else [
+                        Div(P("No traces with errors found", style="color: #64748b; text-align: center; padding: 40px;"))
+                    ],
+                    style="flex: 1; max-height: 600px; overflow-y: auto;"
+                ),
+                style="display: flex; gap: 24px; margin-top: 24px;"
             ),
             cls="main-container"
         )
@@ -643,12 +794,14 @@ def get():
 
 
 @rt('/traces')
-def get(page: int = 1, limit: int = 50, model: str = None, use_case: str = None, has_errors: str = None, multi_element_only: str = None):
+def get(page: int = 1, limit: int = 50, model: str = None, use_case: str = None, has_errors: str = None, multi_element_only: str = None, with_metadata: str = None, multi_turn: str = None):
     logger.info(f"Loading all traces page {page} with filters")
 
     # Parse boolean filters
     has_errors_bool = has_errors == 'true' if has_errors else None
     multi_element_bool = multi_element_only == 'true' if multi_element_only else False
+    with_metadata_bool = with_metadata == 'true' if with_metadata else None
+    multi_turn_bool = multi_turn == 'true' if multi_turn else None
 
     # Get filtered traces
     traces, total = get_filtered_traces(
@@ -657,7 +810,9 @@ def get(page: int = 1, limit: int = 50, model: str = None, use_case: str = None,
         model=model if model else None,
         use_case=use_case if use_case else None,
         has_errors=has_errors_bool,
-        multi_element_only=multi_element_bool
+        multi_element_only=multi_element_bool,
+        with_metadata=with_metadata_bool,
+        multi_turn=multi_turn_bool
     )
 
     # Get available filters
@@ -676,6 +831,10 @@ def get(page: int = 1, limit: int = 50, model: str = None, use_case: str = None,
         query_parts.append(f"has_errors={has_errors}")
     if multi_element_only:
         query_parts.append(f"multi_element_only={multi_element_only}")
+    if with_metadata:
+        query_parts.append(f"with_metadata={with_metadata}")
+    if multi_turn:
+        query_parts.append(f"multi_turn={multi_turn}")
     query_string = "&".join(query_parts)
     query_suffix = f"&{query_string}" if query_string else ""
 
@@ -685,13 +844,13 @@ def get(page: int = 1, limit: int = 50, model: str = None, use_case: str = None,
             A("← Back to Dashboard", href="/", cls="back-link"),
             Div(
                 H2("📋 All Traces", style="margin: 0;"),
-                P(f"Showing {offset + 1}-{min(offset + limit, total)} of {total:,} elements", style="margin: 4px 0 0 0; color: #94a3b8;"),
+                P(f"Showing {offset + 1}-{min(offset + limit, total)} of {total:,} traces", style="margin: 4px 0 0 0; color: #94a3b8;"),
                 cls="section-header"
             ),
             Div(
                 # Filter panel on the left
                 Div(
-                    FilterPanel(filters, current_model=model, current_use_case=use_case, has_errors=has_errors_bool, multi_element_only=multi_element_bool),
+                    FilterPanel(filters, current_model=model, current_use_case=use_case, has_errors=has_errors_bool, multi_element_only=multi_element_bool, with_metadata=with_metadata_bool, multi_turn=multi_turn_bool),
                     style="width: 280px; flex-shrink: 0;"
                 ),
                 # Traces list on the right
@@ -721,7 +880,7 @@ def get(page: int = 1, limit: int = 50, model: str = None, use_case: str = None,
 
 @rt('/multi-element')
 def get():
-    logger.info("Loading multi-element traces page")
+    logger.info("Loading multi-trace groups page")
 
     traces = get_traces_with_multiple_elements(limit=100)
     analysis = run_analysis()
@@ -731,30 +890,30 @@ def get():
         Div(
             A("← Back to Dashboard", href="/", cls="back-link"),
             Div(
-                H2("📦 Traces with Multiple Elements", style="margin: 0;"),
-                P(f"{len(traces)} traces found with multiple elements", style="margin: 4px 0 0 0; color: #94a3b8;"),
+                H2("📦 Trace IDs with Multiple Traces", style="margin: 0;"),
+                P(f"{len(traces)} trace IDs found with multiple traces", style="margin: 4px 0 0 0; color: #94a3b8;"),
                 cls="section-header"
             ),
             # Stats panel
             MultiElementStatsPanel(analysis.multi_element_stats),
             # Explanation
             Div(
-                H3("What are Multi-Element Traces?", style="margin-bottom: 12px; color: #e2e8f0;"),
-                P("Each trace can have multiple elements representing different stages or retries of the same conversation. "
+                H3("What are Multi-Trace Groups?", style="margin-bottom: 12px; color: #e2e8f0;"),
+                P("Each trace ID can have multiple traces representing different stages or retries of the same conversation. "
                   "These might occur due to retries, different model calls, or progressive conversation building.",
                   style="color: #94a3b8; font-size: 0.9em; line-height: 1.6;"),
                 style="background: #1f2940; padding: 20px; border-radius: 12px; border: 1px solid #2d3748; margin: 24px 0;"
             ),
             # Trace list
             Div(
-                H3("Multi-Element Traces", style="margin-bottom: 16px; color: #e2e8f0;"),
+                H3("Multi-Trace Groups", style="margin-bottom: 16px; color: #e2e8f0;"),
                 *[
                     A(
                         Div(
                             Div(
                                 Div(
-                                    Span(f"Trace: {trace['trace_id'][:16]}...", style="font-weight: 600; color: #e2e8f0;"),
-                                    Span(f"📦 {trace['element_count']} elements", style="background: #8b5cf6; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75em; margin-left: 12px;"),
+                                    Span(f"Trace ID: {trace['trace_id'][:16]}...", style="font-weight: 600; color: #e2e8f0;"),
+                                    Span(f"📦 {trace['element_count']} traces", style="background: #8b5cf6; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75em; margin-left: 12px;"),
                                     style="display: flex; align-items: center;"
                                 ),
                                 Div(
@@ -764,8 +923,8 @@ def get():
                                 style="flex: 1;"
                             ),
                             Div(
-                                Div(f"First: {trace['first_created'][:19] if trace['first_created'] else 'N/A'}", style="font-size: 0.8em; color: #64748b;"),
-                                Div(f"Last: {trace['last_created'][:19] if trace['last_created'] else 'N/A'}", style="font-size: 0.8em; color: #64748b;"),
+                                Div(f"First: {format_date(trace['first_created'])}", style="font-size: 0.8em; color: #64748b;"),
+                                Div(f"Last: {format_date(trace['last_created'])}", style="font-size: 0.8em; color: #64748b;"),
                                 style="text-align: right;"
                             ),
                             style="display: flex; justify-content: space-between; padding: 16px;"
@@ -778,7 +937,7 @@ def get():
                 ],
                 style="max-height: 600px; overflow-y: auto;"
             ) if traces else Div(
-                P("No traces with multiple elements found", style="color: #64748b; text-align: center; padding: 40px;")
+                P("No trace IDs with multiple traces found", style="color: #64748b; text-align: center; padding: 40px;")
             ),
             cls="main-container"
         )
