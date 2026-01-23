@@ -114,7 +114,16 @@ def UseCaseDistributionChart(use_case_distribution: dict):
     return PieChart(simple_data, "Use Case Distribution", "usecase-pie")
 
 
-def UseCaseCard(prompt_hash: str, info: dict, index: int):
+def UseCaseCard(prompt_hash: str, info: dict, index: int, workspace_stats: list = None):
+    """
+    Render a use case card.
+
+    Args:
+        prompt_hash: The system prompt hash
+        info: Use case info dict from analysis
+        index: Index for numbering
+        workspace_stats: List of {'workspace': str, 'region': str, 'count': int} from metadata
+    """
     # Use actual use case name if available
     use_case_name = info.get('use_case_name')
     title = use_case_name if use_case_name else f"Use Case #{index + 1}"
@@ -138,8 +147,57 @@ def UseCaseCard(prompt_hash: str, info: dict, index: int):
     if version:
         version_badge = Span(version, style="background: #374151; color: #d1d5db; padding: 2px 8px; border-radius: 4px; font-size: 0.7em;")
 
-    # Workspace info
-    workspace = info.get('workspace', '')
+    # Build workspace display from metadata stats
+    workspace_display = None
+    if workspace_stats:
+        # Format: (region)workspace(count), ...
+        # Region colors
+        region_colors = {'US': '#3b82f6', 'EU': '#8b5cf6', 'IN': '#f59e0b', '?': '#6b7280'}
+
+        workspace_parts = []
+        for ws in workspace_stats[:5]:  # Limit to top 5 workspaces
+            region = ws.get('region', '?')
+            workspace_name = ws.get('workspace', 'unknown')
+            count = ws.get('count', 0)
+            color = region_colors.get(region, '#6b7280')
+
+            # Add title attribute for hover tooltip with full name
+            is_truncated = len(workspace_name) > 15
+            display_name = f"{workspace_name[:15]}..." if is_truncated else workspace_name
+
+            workspace_parts.append(
+                Span(
+                    Span(f"({region})", style=f"color: {color}; font-weight: 600;"),
+                    Span(f"{display_name}({count})", style="color: #94a3b8;"),
+                    title=f"{workspace_name} ({region}) - {count} traces",  # Hover tooltip
+                    style="margin-right: 8px; font-size: 0.75em; cursor: help;"
+                )
+            )
+
+        if len(workspace_stats) > 5:
+            # Build tooltip text for remaining workspaces
+            remaining = workspace_stats[5:]
+            remaining_text = "\n".join([
+                f"({ws.get('region', '?')}) {ws.get('workspace', 'unknown')}: {ws.get('count', 0)} traces"
+                for ws in remaining
+            ])
+            workspace_parts.append(
+                Span(
+                    f"+{len(remaining)} more",
+                    title=remaining_text,  # Hover tooltip with all remaining
+                    style="color: #64748b; font-size: 0.7em; cursor: help; text-decoration: underline dotted;"
+                )
+            )
+
+        workspace_display = Div(
+            *workspace_parts,
+            style="margin-top: 8px; display: flex; flex-wrap: wrap; gap: 4px; align-items: center;"
+        )
+    else:
+        # Fallback to old workspace info from prompts table
+        workspace = info.get('workspace', '')
+        if workspace:
+            workspace_display = Div(f"Workspace: {workspace}", style="font-size: 0.75em; color: #64748b; margin-top: 8px;")
 
     return A(
         Div(
@@ -156,7 +214,7 @@ def UseCaseCard(prompt_hash: str, info: dict, index: int):
             Div(
                 Div(info['description'][:80] + "..." if len(info.get('description', '')) > 80 else info.get('description', ''),
                     style="font-size: 0.85em; color: #94a3b8; margin-top: 12px; line-height: 1.4;") if not use_case_name else None,
-                Div(f"Workspace: {workspace}", style="font-size: 0.75em; color: #64748b; margin-top: 8px;") if workspace else None,
+                workspace_display,
                 Div(f"Model: {info.get('sample_model', 'N/A').split('/')[-1]}",
                     style="font-size: 0.75em; color: #64748b; margin-top: 4px;"),
             ),
@@ -190,6 +248,21 @@ def TraceListItem(trace: dict, show_use_case: bool = False):
             style="background: #8b5cf6; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.7em; margin-left: 8px;"
         )
 
+    # Patient/workspace info badges
+    patient_info = []
+    if trace.get('workspace_name'):
+        patient_info.append(
+            Span(trace['workspace_name'], style="background: #059669; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.7em; margin-right: 4px;")
+        )
+    if trace.get('patient_name'):
+        patient_info.append(
+            Span(f"🏥 {trace['patient_name'][:20]}{'...' if len(trace.get('patient_name', '')) > 20 else ''}", style="color: #94a3b8; font-size: 0.75em;")
+        )
+
+    patient_row = None
+    if patient_info:
+        patient_row = Div(*patient_info, style="margin-top: 4px; display: flex; align-items: center; gap: 4px;")
+
     return A(
         Div(
             Div(
@@ -204,6 +277,7 @@ def TraceListItem(trace: dict, show_use_case: bool = False):
                     Span("🔧" if trace.get('has_tool_calls') else "", style="margin-left: 8px;"),
                     style="margin-top: 4px;"
                 ),
+                patient_row,
                 style="flex: 1;"
             ),
             Div(
@@ -417,7 +491,10 @@ def MultiElementStatsPanel(stats: dict):
     )
 
 
-def FilterPanel(filters: dict, current_model: str = None, current_use_case: str = None, has_errors: bool = None, multi_element_only: bool = False, with_metadata: bool = None, multi_turn: bool = None):
+def FilterPanel(filters: dict, current_model: str = None, current_use_case: str = None, has_errors: bool = None, multi_element_only: bool = False, with_metadata: bool = None, multi_turn: bool = None, current_workspace: str = None):
+    # Get workspaces from filters
+    workspaces = filters.get('workspaces', [])
+
     return Div(
         H4("Filters", style="margin-bottom: 12px; color: #e2e8f0;"),
         Form(
@@ -441,6 +518,17 @@ def FilterPanel(filters: dict, current_model: str = None, current_use_case: str 
                 ),
                 style="margin-bottom: 12px;"
             ),
+            # Workspace filter
+            Div(
+                Label("Workspace:", style="color: #94a3b8; font-size: 0.85em;"),
+                Select(
+                    Option("All Workspaces", value="", selected=not current_workspace),
+                    *[Option(f"{w['workspace_name']} ({w['count']})", value=w['workspace_name'], selected=w['workspace_name'] == current_workspace) for w in workspaces],
+                    name="workspace",
+                    style="width: 100%; padding: 8px; background: #0f0f1a; color: #e2e8f0; border: 1px solid #2d3748; border-radius: 4px;"
+                ),
+                style="margin-bottom: 12px;"
+            ) if workspaces else None,
             Div(
                 Label(
                     Input(type="checkbox", name="has_errors", value="true", checked=has_errors, style="margin-right: 8px;"),
@@ -498,6 +586,40 @@ def ElementCard(element: dict, index: int, total: int):
         ),
         style="display: flex; justify-content: space-between; padding: 16px; background: #16213e; border-radius: 8px; border: 1px solid #2d3748; margin-bottom: 8px; cursor: pointer;",
         onclick=f"showElement({index})"
+    )
+
+
+def PatientMetadataPanel(metadata: dict):
+    """Panel to display patient/workspace metadata in trace detail view."""
+    if not metadata:
+        return None
+
+    match_status = "Matched" if metadata.get('match_success') else "Not Matched"
+    match_color = "#10b981" if metadata.get('match_success') else "#ef4444"
+
+    return Div(
+        H4("Patient Information", style="margin-bottom: 12px; color: #059669; font-size: 0.9em;"),
+        Div(
+            # Match status badge
+            Span(match_status, style=f"background: {match_color}; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75em; margin-bottom: 8px; display: inline-block;"),
+            # Patient details
+            Div(
+                Div(f"Patient ID: {metadata.get('patient_id') or 'N/A'}", style="font-size: 0.85em; color: #e2e8f0; margin-bottom: 4px;"),
+                Div(f"Patient Name: {metadata.get('patient_name') or 'N/A'}", style="font-size: 0.85em; color: #e2e8f0; margin-bottom: 4px;"),
+                Div(f"Patient PK: {metadata.get('patient_pk') or 'N/A'}", style="font-size: 0.85em; color: #64748b; margin-bottom: 4px;") if metadata.get('patient_pk') else None,
+                style="margin-top: 8px;"
+            ),
+            # Workspace details
+            Div(
+                Div(f"Workspace: {metadata.get('workspace_name') or 'N/A'}", style="font-size: 0.85em; color: #10b981; font-weight: 600; margin-bottom: 4px;"),
+                Div(f"Workspace ID: {metadata.get('workspace_id') or 'N/A'}", style="font-size: 0.85em; color: #64748b; margin-bottom: 4px;") if metadata.get('workspace_id') else None,
+                Div(f"Replica: {metadata.get('replica_source') or 'N/A'}", style="font-size: 0.85em; color: #64748b; margin-bottom: 4px;") if metadata.get('replica_source') else None,
+                style="margin-top: 8px;"
+            ),
+            # Match error if any
+            Div(f"Note: {metadata.get('match_error')}", style="font-size: 0.8em; color: #f59e0b; margin-top: 8px;") if metadata.get('match_error') else None,
+        ),
+        style="background: #0f2f1a; padding: 12px; border-radius: 8px; margin-bottom: 16px; border: 1px solid #059669;"
     )
 
 

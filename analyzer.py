@@ -9,6 +9,10 @@ from typing import Optional
 from pathlib import Path
 
 from config import TRACES_DB, PROMPTS_DIR, ANALYSIS_CACHE
+from metadata_loader import (
+    get_trace_metadata, get_metadata_for_trace_id, get_available_workspaces,
+    get_metadata_stats, metadata_table_exists
+)
 
 logger = logging.getLogger(__name__)
 
@@ -309,20 +313,42 @@ def get_random_traces_for_use_case(prompt_hash: str, limit: int = 5) -> list[dic
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute('''
-        SELECT t.element_id, t.trace_id, t.model, t.num_turns, t.has_tool_calls,
-               t.cost, t.total_tokens, t.response_time, t.created_at,
-               t.potential_error_indicators, t.user_disagreement_detected,
-               (SELECT COUNT(*) FROM traces t2 WHERE t2.trace_id = t.trace_id) as element_count
-        FROM traces t
-        WHERE t.system_prompt_hash = ?
-        ORDER BY RANDOM()
-        LIMIT ?
-    ''', (prompt_hash, limit))
+    # Check if metadata table exists
+    has_metadata_table = False
+    try:
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trace_metadata'")
+        has_metadata_table = cursor.fetchone() is not None
+    except:
+        pass
+
+    if has_metadata_table:
+        cursor.execute('''
+            SELECT t.element_id, t.trace_id, t.model, t.num_turns, t.has_tool_calls,
+                   t.cost, t.total_tokens, t.response_time, t.created_at,
+                   t.potential_error_indicators, t.user_disagreement_detected,
+                   (SELECT COUNT(*) FROM traces t2 WHERE t2.trace_id = t.trace_id) as element_count,
+                   m.workspace_name, m.patient_id, m.patient_name
+            FROM traces t
+            LEFT JOIN trace_metadata m ON t.element_id = m.element_id
+            WHERE t.system_prompt_hash = ?
+            ORDER BY RANDOM()
+            LIMIT ?
+        ''', (prompt_hash, limit))
+    else:
+        cursor.execute('''
+            SELECT t.element_id, t.trace_id, t.model, t.num_turns, t.has_tool_calls,
+                   t.cost, t.total_tokens, t.response_time, t.created_at,
+                   t.potential_error_indicators, t.user_disagreement_detected,
+                   (SELECT COUNT(*) FROM traces t2 WHERE t2.trace_id = t.trace_id) as element_count
+            FROM traces t
+            WHERE t.system_prompt_hash = ?
+            ORDER BY RANDOM()
+            LIMIT ?
+        ''', (prompt_hash, limit))
 
     traces = []
     for row in cursor.fetchall():
-        traces.append({
+        trace_dict = {
             'element_id': row[0],
             'trace_id': row[1],
             'model': row[2],
@@ -335,7 +361,13 @@ def get_random_traces_for_use_case(prompt_hash: str, limit: int = 5) -> list[dic
             'potential_error_indicators': row[9],
             'user_disagreement_detected': bool(row[10]),
             'element_count': row[11]
-        })
+        }
+        # Add metadata fields if available
+        if has_metadata_table and len(row) > 12:
+            trace_dict['workspace_name'] = row[12]
+            trace_dict['patient_id'] = row[13]
+            trace_dict['patient_name'] = row[14]
+        traces.append(trace_dict)
 
     conn.close()
     return traces
@@ -371,9 +403,17 @@ def get_trace_detail(trace_id: str) -> Optional[dict]:
         if raw_row:
             element_info['raw_data'] = json.loads(raw_row[0])
 
+        # Get metadata for this element (patient/workspace info)
+        metadata = get_trace_metadata(element_info['element_id'])
+        if metadata:
+            element_info['patient_metadata'] = metadata
+
         elements.append(element_info)
 
     conn.close()
+
+    # Get first element's metadata for summary
+    first_metadata = elements[0].get('patient_metadata') if elements else None
 
     # Return combined info
     return {
@@ -384,6 +424,11 @@ def get_trace_detail(trace_id: str) -> Optional[dict]:
         'model': elements[0].get('model'),
         'system_prompt_hash': elements[0].get('system_prompt_hash'),
         'system_prompt_file': elements[0].get('system_prompt_file'),
+        # Patient/workspace info from metadata
+        'patient_id': first_metadata.get('patient_id') if first_metadata else None,
+        'patient_name': first_metadata.get('patient_name') if first_metadata else None,
+        'workspace_name': first_metadata.get('workspace_name') if first_metadata else None,
+        'workspace_id': first_metadata.get('workspace_id') if first_metadata else None,
     }
 
 
@@ -412,6 +457,12 @@ def get_element_detail(element_id: str) -> Optional[dict]:
     element_info['total_elements'] = cursor.fetchone()[0]
 
     conn.close()
+
+    # Get metadata for this element (patient/workspace info)
+    metadata = get_trace_metadata(element_id)
+    if metadata:
+        element_info['patient_metadata'] = metadata
+
     return element_info
 
 
@@ -554,45 +605,61 @@ def get_filtered_traces(
     has_errors: bool = None,
     multi_element_only: bool = False,
     with_metadata: bool = None,
-    multi_turn: bool = None
+    multi_turn: bool = None,
+    workspace: str = None
 ) -> tuple[list[dict], int]:
     """Get filtered list of traces with pagination."""
     conn = get_db_connection()
     cursor = conn.cursor()
 
+    # Check if metadata table exists for workspace filtering
+    has_metadata_table = False
+    try:
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trace_metadata'")
+        has_metadata_table = cursor.fetchone() is not None
+    except:
+        pass
+
     # Build WHERE clause
     conditions = []
     params = []
+    join_clause = ""
 
     if model:
-        conditions.append('model = ?')
+        conditions.append('t.model = ?')
         params.append(model)
 
     if use_case:
-        conditions.append('system_prompt_hash = ?')
+        conditions.append('t.system_prompt_hash = ?')
         params.append(use_case)
 
     if has_errors:
-        conditions.append("(potential_error_indicators != '' OR user_disagreement_detected = 1)")
+        conditions.append("(t.potential_error_indicators != '' OR t.user_disagreement_detected = 1)")
 
     if with_metadata:
-        conditions.append('has_metadata = 1')
+        conditions.append('t.has_metadata = 1')
 
     if multi_turn:
-        conditions.append('is_multi_turn = 1')
+        conditions.append('t.is_multi_turn = 1')
+
+    # Workspace filter requires join with trace_metadata table
+    if workspace and has_metadata_table:
+        join_clause = "LEFT JOIN trace_metadata m ON t.element_id = m.element_id"
+        conditions.append('m.workspace_name = ?')
+        params.append(workspace)
 
     where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
     # Get total count
     if multi_element_only:
         count_sql = f'''
-            SELECT COUNT(DISTINCT trace_id) FROM traces {where_clause}
-            WHERE trace_id IN (
+            SELECT COUNT(DISTINCT t.trace_id) FROM traces t {join_clause} {where_clause}
+            {'AND' if where_clause else 'WHERE'} t.trace_id IN (
                 SELECT trace_id FROM traces GROUP BY trace_id HAVING COUNT(*) > 1
             )
         '''
     else:
-        count_sql = f'SELECT COUNT(*) FROM traces {where_clause}'
+        count_sql = f'SELECT COUNT(*) FROM traces t {join_clause} {where_clause}'
 
     cursor.execute(count_sql, params)
     total = cursor.fetchone()[0]
@@ -600,29 +667,39 @@ def get_filtered_traces(
     # Get traces
     offset = (page - 1) * limit
 
+    # Base select columns
+    select_cols = '''
+        t.element_id, t.trace_id, t.model, t.num_turns, t.has_tool_calls, t.cost,
+        t.total_tokens, t.response_time, t.created_at, t.potential_error_indicators,
+        t.user_disagreement_detected, t.system_prompt_hash,
+        (SELECT COUNT(*) FROM traces t2 WHERE t2.trace_id = t.trace_id) as element_count
+    '''
+
+    # Add metadata columns if table exists
+    if has_metadata_table:
+        select_cols += ', m.workspace_name, m.patient_id, m.patient_name'
+        if not join_clause:
+            join_clause = "LEFT JOIN trace_metadata m ON t.element_id = m.element_id"
+
     if multi_element_only:
         sql = f'''
-            SELECT element_id, trace_id, model, num_turns, has_tool_calls, cost,
-                   total_tokens, response_time, created_at, potential_error_indicators,
-                   user_disagreement_detected, system_prompt_hash,
-                   (SELECT COUNT(*) FROM traces t2 WHERE t2.trace_id = traces.trace_id) as element_count
-            FROM traces
+            SELECT {select_cols}
+            FROM traces t
+            {join_clause}
             {where_clause}
-            {'AND' if where_clause else 'WHERE'} trace_id IN (
+            {'AND' if where_clause else 'WHERE'} t.trace_id IN (
                 SELECT trace_id FROM traces GROUP BY trace_id HAVING COUNT(*) > 1
             )
-            ORDER BY parsed_timestamp DESC
+            ORDER BY t.parsed_timestamp DESC
             LIMIT ? OFFSET ?
         '''
     else:
         sql = f'''
-            SELECT element_id, trace_id, model, num_turns, has_tool_calls, cost,
-                   total_tokens, response_time, created_at, potential_error_indicators,
-                   user_disagreement_detected, system_prompt_hash,
-                   (SELECT COUNT(*) FROM traces t2 WHERE t2.trace_id = traces.trace_id) as element_count
-            FROM traces
+            SELECT {select_cols}
+            FROM traces t
+            {join_clause}
             {where_clause}
-            ORDER BY parsed_timestamp DESC
+            ORDER BY t.parsed_timestamp DESC
             LIMIT ? OFFSET ?
         '''
 
@@ -630,7 +707,7 @@ def get_filtered_traces(
 
     traces = []
     for row in cursor.fetchall():
-        traces.append({
+        trace_dict = {
             'element_id': row[0],
             'trace_id': row[1],
             'model': row[2],
@@ -644,7 +721,13 @@ def get_filtered_traces(
             'user_disagreement_detected': bool(row[10]),
             'system_prompt_hash': row[11],
             'element_count': row[12]
-        })
+        }
+        # Add metadata fields if available
+        if has_metadata_table and len(row) > 13:
+            trace_dict['workspace_name'] = row[13]
+            trace_dict['patient_id'] = row[14]
+            trace_dict['patient_name'] = row[15]
+        traces.append(trace_dict)
 
     conn.close()
     return traces, total
@@ -670,9 +753,13 @@ def get_available_filters() -> dict:
 
     conn.close()
 
+    # Get workspaces from metadata table
+    workspaces = get_available_workspaces()
+
     return {
         'models': models,
-        'use_cases': use_cases
+        'use_cases': use_cases,
+        'workspaces': workspaces
     }
 
 
@@ -706,6 +793,70 @@ def get_model_stats_by_use_case() -> dict:
             'count': row[2],
             'avg_cost': round(row[3] or 0, 6),
             'avg_response_time': round(row[4] or 0, 0)
+        })
+
+    conn.close()
+    return result
+
+
+def get_workspace_stats_by_use_case() -> dict:
+    """
+    Get workspace stats from metadata table grouped by use case (system_prompt_hash).
+
+    Returns:
+        dict: {prompt_hash: [{'workspace': str, 'region': str, 'count': int}, ...]}
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Check if metadata table exists
+    try:
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trace_metadata'")
+        if not cursor.fetchone():
+            conn.close()
+            return {}
+    except:
+        conn.close()
+        return {}
+
+    # Query workspace stats joined with traces to get system_prompt_hash
+    cursor.execute('''
+        SELECT t.system_prompt_hash, m.workspace_name, m.replica_source, COUNT(*) as count
+        FROM traces t
+        JOIN trace_metadata m ON t.element_id = m.element_id
+        WHERE m.workspace_name IS NOT NULL AND m.workspace_name != ''
+        GROUP BY t.system_prompt_hash, m.workspace_name, m.replica_source
+        ORDER BY t.system_prompt_hash, count DESC
+    ''')
+
+    result = {}
+    for row in cursor.fetchall():
+        prompt_hash, workspace, replica, count = row
+
+        # Extract region from replica_source (e.g., "lcusreplica" -> "US")
+        region = "?"
+        if replica:
+            replica_lower = replica.lower()
+            if 'lcus' in replica_lower:
+                region = "US"
+            elif 'lceu' in replica_lower:
+                region = "EU"
+            elif 'lcin' in replica_lower:
+                region = "IN"
+            elif 'us' in replica_lower:
+                region = "US"
+            elif 'eu' in replica_lower:
+                region = "EU"
+            elif 'in' in replica_lower:
+                region = "IN"
+
+        if prompt_hash not in result:
+            result[prompt_hash] = []
+
+        result[prompt_hash].append({
+            'workspace': workspace,
+            'region': region,
+            'count': count
         })
 
     conn.close()

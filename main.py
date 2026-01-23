@@ -15,12 +15,15 @@ from analyzer import (
     run_analysis, get_random_traces_for_use_case, get_trace_detail,
     get_system_prompt_content, get_traces_with_errors, get_model_stats_by_use_case,
     get_traces_with_multiple_elements, get_filtered_traces, get_available_filters,
-    get_element_detail, get_use_case_info
+    get_element_detail, get_use_case_info, get_workspace_stats_by_use_case
 )
 from components import (
     StatCard, ModelDistributionChart, UseCaseDistributionChart, UseCaseCard, TraceListItem,
     MessageBubble, ErrorDetectionPanel, MetadataStatsPanel, TokenCostPanel, NavBar,
-    MultiElementStatsPanel, FilterPanel, ErrorFilterPanel, format_date
+    MultiElementStatsPanel, FilterPanel, ErrorFilterPanel, format_date, PatientMetadataPanel
+)
+from metadata_loader import (
+    load_all_metadata, get_metadata_stats, metadata_table_exists
 )
 
 logging.basicConfig(
@@ -268,6 +271,28 @@ def post():
         )
 
 
+@rt('/reload-metadata')
+def post():
+    """Reload trace metadata from matched JSON files"""
+    logger.info("=" * 60)
+    logger.info("RELOAD METADATA REQUEST RECEIVED")
+    logger.info("=" * 60)
+
+    try:
+        result = load_all_metadata()
+        logger.info(f"Metadata loaded: {result['total_loaded']} records from {result['files_found']} files")
+        logger.info("=" * 60)
+        return RedirectResponse('/', status_code=303)
+    except Exception as e:
+        logger.error(f"RELOAD METADATA EXCEPTION: {str(e)}")
+        return Div(
+            H3("Reload Metadata Error", style="color: #ef4444; margin-bottom: 16px;"),
+            P(f"Exception: {str(e)}", style="color: #f87171;"),
+            A("Back to Dashboard", href="/", style="display: inline-block; margin-top: 16px; padding: 12px 24px; background: #3b82f6; color: white; border-radius: 8px; text-decoration: none;"),
+            style="padding: 24px;"
+        )
+
+
 @rt('/')
 def get():
     logger.info("Loading dashboard")
@@ -289,6 +314,9 @@ def get():
     time_end = format_date(analysis.time_period_end) if analysis.time_period_end != 'Unknown' else 'Unknown'
     time_span = f"{analysis.time_span_days:.0f}" if analysis.time_span_days else "N/A"
 
+    # Get workspace stats from metadata for use case cards
+    workspace_stats_by_use_case = get_workspace_stats_by_use_case()
+
     return Div(
         NavBar("dashboard"),
         Div(
@@ -306,14 +334,28 @@ def get():
                             style="margin: 4px 0 0 0; color: #94a3b8;"
                         ),
                     ),
-                    Form(
-                        Button(
-                            "🔄 Rerun Process",
-                            type="submit",
-                            style="padding: 10px 20px; background: #8b5cf6; color: white; border: none; border-radius: 8px; font-weight: 500; cursor: pointer;"
+                    Div(
+                        Form(
+                            Button(
+                                "🔄 Rerun Process",
+                                type="submit",
+                                style="padding: 10px 20px; background: #8b5cf6; color: white; border: none; border-radius: 8px; font-weight: 500; cursor: pointer; margin-right: 8px;"
+                            ),
+                            action="/reprocess",
+                            method="post",
+                            style="display: inline;"
                         ),
-                        action="/reprocess",
-                        method="post"
+                        Form(
+                            Button(
+                                "📥 Reload Metadata",
+                                type="submit",
+                                style="padding: 10px 20px; background: #059669; color: white; border: none; border-radius: 8px; font-weight: 500; cursor: pointer;"
+                            ),
+                            action="/reload-metadata",
+                            method="post",
+                            style="display: inline;"
+                        ),
+                        style="display: flex; gap: 8px;"
                     ),
                     style="display: flex; justify-content: space-between; align-items: flex-start;"
                 ),
@@ -344,7 +386,7 @@ def get():
             Div(
                 H3("Use Cases", style="margin-bottom: 16px; color: #e2e8f0;"),
                 Div(
-                    *[UseCaseCard(hash, info, i) for i, (hash, info) in enumerate(list(analysis.use_case_distribution.items())[:6])],
+                    *[UseCaseCard(hash, info, i, workspace_stats=workspace_stats_by_use_case.get(hash)) for i, (hash, info) in enumerate(list(analysis.use_case_distribution.items())[:6])],
                     cls="use-case-grid"
                 ),
                 A("View All Use Cases →", href="/use-cases", style="display: block; margin-top: 16px; text-align: right;"),
@@ -359,6 +401,7 @@ def get():
 def get(type_filter: str = None):
     logger.info(f"Loading use cases page with type_filter={type_filter}")
     analysis = run_analysis()
+    workspace_stats_by_use_case = get_workspace_stats_by_use_case()
 
     # Get all unique types for filter dropdown and count matched/unmatched
     all_types = set()
@@ -456,7 +499,7 @@ def get(type_filter: str = None):
                 style="display: flex; align-items: center; gap: 8px; margin-bottom: 24px; flex-wrap: wrap;"
             ),
             Div(
-                *[UseCaseCard(hash, info, i) for i, (hash, info) in enumerate(filtered_use_cases.items())],
+                *[UseCaseCard(hash, info, i, workspace_stats=workspace_stats_by_use_case.get(hash)) for i, (hash, info) in enumerate(filtered_use_cases.items())],
                 cls="use-case-grid"
             ) if filtered_use_cases else Div(
                 P("No use cases found for this filter", style="color: #64748b; text-align: center; padding: 40px;")
@@ -671,12 +714,19 @@ def get(trace_id: str, element_idx: int = 0):
                     A(use_case_name, href=f"/use-case/{trace_detail.get('system_prompt_hash', '')}",
                       style="background: #10b981; color: white; padding: 4px 12px; border-radius: 4px; font-size: 0.85em; margin-right: 12px; text-decoration: none;") if use_case_name else Span(f"Use Case: {trace_detail.get('system_prompt_hash', '')[:8]}...", style="background: #6b7280; color: white; padding: 4px 12px; border-radius: 4px; font-size: 0.85em; margin-right: 12px;"),
                     Span(f"Model: {model}", style="background: #3b82f6; color: white; padding: 4px 12px; border-radius: 4px; font-size: 0.85em; margin-right: 12px;"),
+                    Span(trace_detail.get('workspace_name'), style="background: #059669; color: white; padding: 4px 12px; border-radius: 4px; font-size: 0.85em; margin-right: 12px;") if trace_detail.get('workspace_name') else None,
                     Span(f"{current_element.get('num_turns', 0)} turns", style="color: #94a3b8; margin-right: 12px;"),
                     Span(f"${current_element.get('cost', 0):.4f}", style="color: #10b981; margin-right: 12px;"),
                     Span(f"{current_element.get('total_tokens', 0):,} tokens", style="color: #8b5cf6;"),
                     Span(f"📦 Trace {element_idx + 1}/{element_count}", style="margin-left: 12px; color: #8b5cf6;") if element_count > 1 else None,
                     style="margin-top: 8px;"
                 ),
+                # Patient info row
+                Div(
+                    Span(f"🏥 Patient: {trace_detail.get('patient_name')}", style="color: #94a3b8; margin-right: 16px;"),
+                    Span(f"ID: {trace_detail.get('patient_id')}", style="color: #64748b;"),
+                    style="margin-top: 8px; font-size: 0.9em;"
+                ) if trace_detail.get('patient_name') else None,
                 cls="section-header"
             ),
             element_selector,
@@ -688,7 +738,7 @@ def get(trace_id: str, element_idx: int = 0):
                     *rendered_messages,
                     cls="split-panel"
                 ),
-                # Right panel - System Prompt
+                # Right panel - System Prompt and Metadata
                 Div(
                     H3("System Prompt", style="margin-bottom: 16px; color: #e2e8f0;"),
                     Div(
@@ -696,6 +746,8 @@ def get(trace_id: str, element_idx: int = 0):
                              style="font-size: 0.85em; color: #64748b; font-family: monospace;"),
                         style="margin-bottom: 12px;"
                     ),
+                    # Patient metadata panel (if available)
+                    PatientMetadataPanel(current_element.get('patient_metadata')),
                     # Trace metadata
                     Div(
                         H4("Trace Metadata", style="margin-bottom: 12px; color: #94a3b8; font-size: 0.85em;"),
@@ -707,7 +759,7 @@ def get(trace_id: str, element_idx: int = 0):
                         Div(f"Error Indicators: {current_element.get('potential_error_indicators') or 'None'}", style=f"font-size: 0.85em; color: {'#f87171' if current_element.get('potential_error_indicators') else '#64748b'}; margin-bottom: 4px;"),
                         style="background: #0f0f1a; padding: 12px; border-radius: 8px; margin-bottom: 16px;"
                     ),
-                    Pre(system_prompt, style="white-space: pre-wrap; color: #e2e8f0; max-height: calc(100vh - 450px); overflow-y: auto;"),
+                    Pre(system_prompt, style="white-space: pre-wrap; color: #e2e8f0; max-height: calc(100vh - 550px); overflow-y: auto;"),
                     cls="split-panel"
                 ),
                 cls="split-view"
@@ -794,7 +846,7 @@ def get(model: str = None, use_case: str = None, error_type: str = None):
 
 
 @rt('/traces')
-def get(page: int = 1, limit: int = 50, model: str = None, use_case: str = None, has_errors: str = None, multi_element_only: str = None, with_metadata: str = None, multi_turn: str = None):
+def get(page: int = 1, limit: int = 50, model: str = None, use_case: str = None, has_errors: str = None, multi_element_only: str = None, with_metadata: str = None, multi_turn: str = None, workspace: str = None):
     logger.info(f"Loading all traces page {page} with filters")
 
     # Parse boolean filters
@@ -812,7 +864,8 @@ def get(page: int = 1, limit: int = 50, model: str = None, use_case: str = None,
         has_errors=has_errors_bool,
         multi_element_only=multi_element_bool,
         with_metadata=with_metadata_bool,
-        multi_turn=multi_turn_bool
+        multi_turn=multi_turn_bool,
+        workspace=workspace if workspace else None
     )
 
     # Get available filters
@@ -835,6 +888,8 @@ def get(page: int = 1, limit: int = 50, model: str = None, use_case: str = None,
         query_parts.append(f"with_metadata={with_metadata}")
     if multi_turn:
         query_parts.append(f"multi_turn={multi_turn}")
+    if workspace:
+        query_parts.append(f"workspace={workspace}")
     query_string = "&".join(query_parts)
     query_suffix = f"&{query_string}" if query_string else ""
 
@@ -850,7 +905,7 @@ def get(page: int = 1, limit: int = 50, model: str = None, use_case: str = None,
             Div(
                 # Filter panel on the left
                 Div(
-                    FilterPanel(filters, current_model=model, current_use_case=use_case, has_errors=has_errors_bool, multi_element_only=multi_element_bool, with_metadata=with_metadata_bool, multi_turn=multi_turn_bool),
+                    FilterPanel(filters, current_model=model, current_use_case=use_case, has_errors=has_errors_bool, multi_element_only=multi_element_bool, with_metadata=with_metadata_bool, multi_turn=multi_turn_bool, current_workspace=workspace),
                     style="width: 280px; flex-shrink: 0;"
                 ),
                 # Traces list on the right
