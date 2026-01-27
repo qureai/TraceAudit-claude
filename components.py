@@ -491,9 +491,19 @@ def MultiElementStatsPanel(stats: dict):
     )
 
 
-def FilterPanel(filters: dict, current_model: str = None, current_use_case: str = None, has_errors: bool = None, multi_element_only: bool = False, with_metadata: bool = None, multi_turn: bool = None, current_workspace: str = None):
+def FilterPanel(filters: dict, current_model: str = None, current_use_case: str = None, has_errors: bool = None, multi_element_only: bool = False, with_metadata: bool = None, multi_turn: bool = None, current_workspace: str = None, current_error_status: str = None, current_error_check: str = None, available_error_checks: list = None):
     # Get workspaces from filters
     workspaces = filters.get('workspaces', [])
+
+    # Build error check options
+    error_check_options = []
+    if available_error_checks:
+        for check in available_error_checks:
+            check_id = check.get('check_id', '')
+            errors = check.get('errors', 0)
+            error_check_options.append(
+                Option(f"{check_id} ({errors})", value=check_id, selected=check_id == current_error_check)
+            )
 
     return Div(
         H4("Filters", style="margin-bottom: 12px; color: #e2e8f0;"),
@@ -512,7 +522,11 @@ def FilterPanel(filters: dict, current_model: str = None, current_use_case: str 
                 Label("Use Case:", style="color: #94a3b8; font-size: 0.85em;"),
                 Select(
                     Option("All Use Cases", value="", selected=not current_use_case),
-                    *[Option(f"{uc['hash'][:8]}... ({uc['count']})", value=uc['hash'], selected=uc['hash'] == current_use_case) for uc in filters.get('use_cases', [])],
+                    *[Option(
+                        f"{uc['name']} ({uc['count']})" if uc.get('name') else f"{uc['hash'][:8]}... ({uc['count']})",
+                        value=uc['hash'],
+                        selected=uc['hash'] == current_use_case
+                    ) for uc in filters.get('use_cases', [])],
                     name="use_case",
                     style="width: 100%; padding: 8px; background: #0f0f1a; color: #e2e8f0; border: 1px solid #2d3748; border-radius: 4px;"
                 ),
@@ -557,6 +571,33 @@ def FilterPanel(filters: dict, current_model: str = None, current_use_case: str 
                 ),
                 style="margin-bottom: 12px;"
             ),
+            # Error Detection Filters section
+            Div(
+                H4("Error Detection", style="margin-bottom: 12px; color: #f59e0b; font-size: 0.9em;"),
+                Div(
+                    Label("Error Status:", style="color: #94a3b8; font-size: 0.85em;"),
+                    Select(
+                        Option("All", value="", selected=not current_error_status),
+                        Option("Has Errors", value="has_errors", selected=current_error_status == "has_errors"),
+                        Option("No Errors", value="no_errors", selected=current_error_status == "no_errors"),
+                        Option("Not Checked", value="not_checked", selected=current_error_status == "not_checked"),
+                        name="error_status",
+                        style="width: 100%; padding: 8px; background: #0f0f1a; color: #e2e8f0; border: 1px solid #2d3748; border-radius: 4px;"
+                    ),
+                    style="margin-bottom: 12px;"
+                ),
+                Div(
+                    Label("Error Check:", style="color: #94a3b8; font-size: 0.85em;"),
+                    Select(
+                        Option("All Checks", value="", selected=not current_error_check),
+                        *error_check_options,
+                        name="error_check",
+                        style="width: 100%; padding: 8px; background: #0f0f1a; color: #e2e8f0; border: 1px solid #2d3748; border-radius: 4px;"
+                    ),
+                    style="margin-bottom: 12px;"
+                ) if error_check_options else None,
+                style="background: #2d2d1f; padding: 12px; border-radius: 8px; margin-bottom: 12px; border: 1px solid #f59e0b;"
+            ) if available_error_checks else None,
             Button("Apply Filters", type="submit", style="width: 100%; padding: 10px; background: #3b82f6; color: white; border: none; border-radius: 6px; cursor: pointer;"),
             A("Clear Filters", href="/traces", style="display: block; text-align: center; margin-top: 8px; color: #64748b; font-size: 0.85em;"),
             method="get",
@@ -623,6 +664,216 @@ def PatientMetadataPanel(metadata: dict):
     )
 
 
+def ErrorCheckResultsPanel(error_summary: dict, element_id: str = None):
+    """
+    Panel to display error check results for a trace in the detail view.
+
+    Args:
+        error_summary: dict with total_checks, errors_found, checked, error_details
+        element_id: Optional element_id for rerun button
+    """
+    if not error_summary.get('checked'):
+        return Div(
+            H4("Error Detection", style="margin-bottom: 12px; color: #f59e0b; font-size: 0.9em;"),
+            Div(
+                Div("Not Checked", style="color: #64748b; margin-bottom: 8px;"),
+                Div("Run error detection to check this trace", style="font-size: 0.85em; color: #94a3b8;"),
+                Form(
+                    Button(
+                        "Run Checks",
+                        type="submit",
+                        style="padding: 8px 16px; background: #f59e0b; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 0.85em; margin-top: 8px;"
+                    ),
+                    action=f"/run-error-check/{element_id}" if element_id else "#",
+                    method="post"
+                ) if element_id else None,
+                style="text-align: center; padding: 16px;"
+            ),
+            style="background: #2d2d1f; padding: 12px; border-radius: 8px; margin-bottom: 16px; border: 1px solid #f59e0b;"
+        )
+
+    errors_found = error_summary.get('errors_found', 0)
+    total_checks = error_summary.get('total_checks', 0)
+    error_details = error_summary.get('error_details', [])
+
+    # Determine status color
+    if errors_found == 0:
+        status_color = '#10b981'
+        status_text = 'All Checks Passed'
+        border_color = '#10b981'
+        bg_color = '#0f2f1a'
+    else:
+        status_color = '#ef4444'
+        status_text = f'{errors_found} Error{"s" if errors_found > 1 else ""} Found'
+        border_color = '#ef4444'
+        bg_color = '#2f1f1f'
+
+    # Build check results list
+    check_items = []
+    for check in error_details:
+        check_id = check.get('check_id', '')
+        check_level = check.get('check_level', 1)
+        has_error = check.get('has_error', False)
+        reason = check.get('error_reason', '')
+
+        # Level colors
+        level_color = '#ef4444' if check_level == 1 else '#8b5cf6'
+        level_label = f"L{check_level}"
+
+        # Status indicator
+        if has_error:
+            status_icon = "❌"
+            item_color = '#f87171'
+        else:
+            status_icon = "✓"
+            item_color = '#4ade80'
+
+        check_items.append(
+            Div(
+                Div(
+                    Span(status_icon, style=f"margin-right: 8px; color: {item_color};"),
+                    Span(level_label, style=f"background: {level_color}; color: white; padding: 1px 6px; border-radius: 3px; font-size: 0.7em; margin-right: 8px;"),
+                    Span(check_id, style=f"color: {'#f87171' if has_error else '#94a3b8'}; font-size: 0.85em;"),
+                    style="display: flex; align-items: center;"
+                ),
+                Div(reason, style="font-size: 0.8em; color: #f59e0b; margin-top: 4px; margin-left: 28px;") if has_error and reason else None,
+                style=f"padding: 8px 0; border-bottom: 1px solid #2d3748;"
+            )
+        )
+
+    return Div(
+        H4("Error Detection Results", style="margin-bottom: 12px; color: #f59e0b; font-size: 0.9em;"),
+        # Status badge
+        Div(
+            Span(status_text, style=f"background: {status_color}; color: white; padding: 4px 12px; border-radius: 4px; font-size: 0.85em;"),
+            Span(f"{total_checks} checks run", style="color: #64748b; font-size: 0.85em; margin-left: 12px;"),
+            style="margin-bottom: 12px;"
+        ),
+        # Check results
+        Div(
+            *check_items,
+            style="max-height: 200px; overflow-y: auto;"
+        ) if check_items else None,
+        # Rerun button
+        Form(
+            Button(
+                "Re-run Checks",
+                type="submit",
+                style="padding: 6px 12px; background: #6b7280; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 0.8em; margin-top: 8px;"
+            ),
+            action=f"/run-error-check/{element_id}" if element_id else "#",
+            method="post"
+        ) if element_id else None,
+        style=f"background: {bg_color}; padding: 12px; border-radius: 8px; margin-bottom: 16px; border: 1px solid {border_color};"
+    )
+
+
+def ErrorDetectionStatsPanel(stats: dict):
+    """Panel showing error detection stats for the dashboard."""
+    if not stats or stats.get('total_checked', 0) == 0:
+        return Div(
+            H3("🔍 Error Detection", style="margin-bottom: 16px; color: #f59e0b;"),
+            Div(
+                P("No traces have been checked yet.", style="color: #64748b; margin-bottom: 12px;"),
+                Form(
+                    Button(
+                        "Run Error Detection",
+                        type="submit",
+                        style="padding: 10px 20px; background: #f59e0b; color: white; border: none; border-radius: 8px; cursor: pointer;"
+                    ),
+                    action="/run-error-checks",
+                    method="post"
+                ),
+                style="text-align: center; padding: 20px;"
+            ),
+            style="background: #1f2940; padding: 20px; border-radius: 12px; border: 1px solid #2d3748;"
+        )
+
+    total_checked = stats.get('total_checked', 0)
+    traces_with_errors = stats.get('traces_with_errors', 0)
+    error_rate = stats.get('error_rate', 0)
+    by_check = stats.get('by_check', [])
+
+    return Div(
+        H3("🔍 Error Detection", style="margin-bottom: 16px; color: #f59e0b;"),
+        Div(
+            StatCard("Traces Checked", f"{total_checked:,}", color="#3b82f6"),
+            StatCard("With Errors", traces_with_errors, f"{error_rate}% error rate", "#ef4444"),
+            style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin-bottom: 16px;"
+        ),
+        Div(
+            H4("Error Breakdown", style="margin-bottom: 12px; color: #e2e8f0; font-size: 0.9em;"),
+            *[
+                Div(
+                    Div(
+                        Span(f"L{check.get('check_level', 1)}", style=f"background: {'#ef4444' if check.get('check_level') == 1 else '#8b5cf6'}; color: white; padding: 1px 6px; border-radius: 3px; font-size: 0.7em; margin-right: 8px;"),
+                        Span(check.get('check_id', ''), style="flex: 1; color: #e2e8f0; font-size: 0.85em;"),
+                        style="display: flex; align-items: center; flex: 1;"
+                    ),
+                    Span(f"{check.get('errors', 0)}/{check.get('total', 0)}", style="color: #f87171; font-weight: 600; font-size: 0.85em;"),
+                    style="display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid #2d3748;"
+                )
+                for check in by_check[:8]
+            ] if by_check else [Div("No checks recorded", style="color: #64748b;")],
+            style="background: #0f0f1a; padding: 16px; border-radius: 8px;"
+        ),
+        Div(
+            Form(
+                Button(
+                    "Run Error Detection",
+                    type="submit",
+                    style="padding: 8px 16px; background: #f59e0b; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 0.85em; margin-right: 8px;"
+                ),
+                action="/run-error-checks",
+                method="post",
+                style="display: inline;"
+            ),
+            A("View Details →", href="/error-detection", style="color: #3b82f6; font-size: 0.85em;"),
+            style="margin-top: 16px; display: flex; align-items: center; gap: 16px;"
+        ),
+        style="background: #1f2940; padding: 20px; border-radius: 12px; border: 1px solid #2d3748;"
+    )
+
+
+def ErrorDetectionFilterPanel(filters: dict, current_error_status: str = None, current_error_check: str = None, available_checks: list = None):
+    """Filter panel for error detection filters on traces page."""
+    check_options = []
+    if available_checks:
+        for check in available_checks:
+            check_id = check.get('check_id', '')
+            errors = check.get('errors', 0)
+            check_options.append(
+                Option(f"{check_id} ({errors})", value=check_id, selected=check_id == current_error_check)
+            )
+
+    return Div(
+        H4("Error Detection Filters", style="margin-bottom: 12px; color: #f59e0b;"),
+        Div(
+            Label("Error Status:", style="color: #94a3b8; font-size: 0.85em;"),
+            Select(
+                Option("All", value="", selected=not current_error_status),
+                Option("Has Errors", value="has_errors", selected=current_error_status == "has_errors"),
+                Option("No Errors", value="no_errors", selected=current_error_status == "no_errors"),
+                Option("Not Checked", value="not_checked", selected=current_error_status == "not_checked"),
+                name="error_status",
+                style="width: 100%; padding: 8px; background: #0f0f1a; color: #e2e8f0; border: 1px solid #2d3748; border-radius: 4px;"
+            ),
+            style="margin-bottom: 12px;"
+        ),
+        Div(
+            Label("Error Check:", style="color: #94a3b8; font-size: 0.85em;"),
+            Select(
+                Option("All Checks", value="", selected=not current_error_check),
+                *check_options,
+                name="error_check",
+                style="width: 100%; padding: 8px; background: #0f0f1a; color: #e2e8f0; border: 1px solid #2d3748; border-radius: 4px;"
+            ),
+            style="margin-bottom: 12px;"
+        ) if check_options else None,
+        style="background: #2d2d1f; padding: 12px; border-radius: 8px; margin-bottom: 12px; border: 1px solid #f59e0b;"
+    )
+
+
 def ErrorFilterPanel(filters: dict, current_model: str = None, current_use_case: str = None, error_type: str = None):
     """Filter panel for the errors page."""
     return Div(
@@ -642,7 +893,11 @@ def ErrorFilterPanel(filters: dict, current_model: str = None, current_use_case:
                 Label("Use Case:", style="color: #94a3b8; font-size: 0.85em;"),
                 Select(
                     Option("All Use Cases", value="", selected=not current_use_case),
-                    *[Option(f"{uc['hash'][:8]}... ({uc['count']})", value=uc['hash'], selected=uc['hash'] == current_use_case) for uc in filters.get('use_cases', [])],
+                    *[Option(
+                        f"{uc['name']} ({uc['count']})" if uc.get('name') else f"{uc['hash'][:8]}... ({uc['count']})",
+                        value=uc['hash'],
+                        selected=uc['hash'] == current_use_case
+                    ) for uc in filters.get('use_cases', [])],
                     name="use_case",
                     style="width: 100%; padding: 8px; background: #0f0f1a; color: #e2e8f0; border: 1px solid #2d3748; border-radius: 4px;"
                 ),

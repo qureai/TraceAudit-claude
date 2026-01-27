@@ -15,12 +15,17 @@ from analyzer import (
     run_analysis, get_random_traces_for_use_case, get_trace_detail,
     get_system_prompt_content, get_traces_with_errors, get_model_stats_by_use_case,
     get_traces_with_multiple_elements, get_filtered_traces, get_available_filters,
-    get_element_detail, get_use_case_info, get_workspace_stats_by_use_case
+    get_element_detail, get_use_case_info, get_workspace_stats_by_use_case,
+    get_error_summary_for_element, get_available_error_checks, get_detection_error_stats
 )
 from components import (
     StatCard, ModelDistributionChart, UseCaseDistributionChart, UseCaseCard, TraceListItem,
     MessageBubble, ErrorDetectionPanel, MetadataStatsPanel, TokenCostPanel, NavBar,
-    MultiElementStatsPanel, FilterPanel, ErrorFilterPanel, format_date, PatientMetadataPanel
+    MultiElementStatsPanel, FilterPanel, ErrorFilterPanel, format_date, PatientMetadataPanel,
+    ErrorCheckResultsPanel, ErrorDetectionStatsPanel, ErrorDetectionFilterPanel
+)
+from error_detector import (
+    run_all_checks, batch_run_checks, init_error_detection_table
 )
 from metadata_loader import (
     load_all_metadata, get_metadata_stats, metadata_table_exists
@@ -293,6 +298,162 @@ def post():
         )
 
 
+@rt('/error-detection')
+def get():
+    """Error detection details page"""
+    logger.info("Loading error detection page")
+
+    error_stats = get_detection_error_stats()
+    available_checks = get_available_error_checks()
+
+    return Div(
+        NavBar("errors"),
+        Div(
+            A("← Back to Dashboard", href="/", cls="back-link"),
+            Div(
+                H2("🔍 Error Detection Details", style="margin: 0;"),
+                P(f"{error_stats.get('total_checked', 0):,} traces checked, {error_stats.get('traces_with_errors', 0)} with errors ({error_stats.get('error_rate', 0)}%)", style="margin: 4px 0 0 0; color: #94a3b8;"),
+                cls="section-header"
+            ),
+            # Stats cards
+            Div(
+                StatCard("Traces Checked", f"{error_stats.get('total_checked', 0):,}", color="#3b82f6"),
+                StatCard("With Errors", error_stats.get('traces_with_errors', 0), f"{error_stats.get('error_rate', 0)}% error rate", "#ef4444"),
+                StatCard("L1 Checks", error_stats.get('by_level', {}).get('L1', {}).get('total', 0), f"{error_stats.get('by_level', {}).get('L1', {}).get('errors', 0)} errors", "#f59e0b"),
+                StatCard("L2 Checks", error_stats.get('by_level', {}).get('L2', {}).get('total', 0), f"{error_stats.get('by_level', {}).get('L2', {}).get('errors', 0)} errors", "#8b5cf6"),
+                style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px;"
+            ),
+            # Detailed breakdown
+            Div(
+                H3("Check Results Breakdown", style="margin-bottom: 16px; color: #e2e8f0;"),
+                Div(
+                    *[
+                        Div(
+                            Div(
+                                Span(f"L{check.get('check_level', 1)}", style=f"background: {'#ef4444' if check.get('check_level') == 1 else '#8b5cf6'}; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75em; margin-right: 12px;"),
+                                Span(check.get('check_id', ''), style="font-weight: 600; color: #e2e8f0;"),
+                                style="display: flex; align-items: center; flex: 1;"
+                            ),
+                            Div(
+                                Span(f"{check.get('errors', 0)}", style="color: #f87171; font-weight: 700; font-size: 1.1em;"),
+                                Span(f" / {check.get('total', 0)}", style="color: #64748b;"),
+                                Span(f" ({check.get('error_rate', 0)}%)", style="color: #94a3b8; margin-left: 8px;"),
+                                style="text-align: right;"
+                            ),
+                            style="display: flex; justify-content: space-between; align-items: center; padding: 16px; background: #16213e; border-radius: 8px; margin-bottom: 8px; border-left: 4px solid " + ('#ef4444' if check.get('errors', 0) > 0 else '#2d3748') + ";"
+                        )
+                        for check in available_checks
+                    ] if available_checks else [Div("No checks have been run yet", style="color: #64748b; text-align: center; padding: 40px;")],
+                    style="max-height: 500px; overflow-y: auto;"
+                ),
+                style="background: #1f2940; padding: 20px; border-radius: 12px; border: 1px solid #2d3748; margin-bottom: 24px;"
+            ),
+            # Actions
+            Div(
+                H3("Run Error Detection", style="margin-bottom: 16px; color: #e2e8f0;"),
+                Form(
+                    Div(
+                        Label("Use Case:", style="color: #94a3b8; font-size: 0.85em; display: block; margin-bottom: 4px;"),
+                        Select(
+                            Option("All Use Cases with Metadata", value=""),
+                            Option("worklist_rad_report_data_extraction", value="worklist_rad_report_data_extraction"),
+                            Option("worklist_suggest_next_steps", value="worklist_suggest_next_steps"),
+                            Option("worklist_patient_summary", value="worklist_patient_summary"),
+                            name="use_case",
+                            style="padding: 8px; background: #0f0f1a; color: #e2e8f0; border: 1px solid #2d3748; border-radius: 4px; width: 300px;"
+                        ),
+                        style="margin-right: 16px; display: inline-block;"
+                    ),
+                    Div(
+                        Label("Limit:", style="color: #94a3b8; font-size: 0.85em; display: block; margin-bottom: 4px;"),
+                        Input(type="number", name="limit", value="1000", style="padding: 8px; background: #0f0f1a; color: #e2e8f0; border: 1px solid #2d3748; border-radius: 4px; width: 100px;"),
+                        style="margin-right: 16px; display: inline-block;"
+                    ),
+                    Div(
+                        Label(
+                            Input(type="checkbox", name="run_level2", value="true", style="margin-right: 8px;"),
+                            Span("Run Level 2 (LLM) Checks", style="color: #94a3b8; font-size: 0.85em;"),
+                        ),
+                        style="margin-right: 16px; display: inline-block; margin-top: 24px;"
+                    ),
+                    Button(
+                        "Run Error Detection",
+                        type="submit",
+                        style="padding: 10px 24px; background: #f59e0b; color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: 500; margin-top: 24px;"
+                    ),
+                    action="/run-error-checks",
+                    method="post",
+                    style="display: flex; align-items: flex-end; flex-wrap: wrap; gap: 8px;"
+                ),
+                style="background: #1f2940; padding: 20px; border-radius: 12px; border: 1px solid #2d3748;"
+            ),
+            # Link to filtered traces
+            Div(
+                A("View Traces with Errors →", href="/traces?error_status=has_errors", style="color: #3b82f6; font-size: 0.95em;"),
+                style="margin-top: 24px; text-align: right;"
+            ),
+            cls="main-container"
+        )
+    )
+
+
+@rt('/run-error-checks')
+def post(use_case: str = None, limit: int = 1000, run_level2: str = None):
+    """Run batch error detection on traces"""
+    logger.info("=" * 60)
+    logger.info("RUN ERROR CHECKS REQUEST RECEIVED")
+    logger.info(f"Use case: {use_case or 'all'}, Limit: {limit}, Level 2: {run_level2}")
+    logger.info("=" * 60)
+
+    try:
+        # Initialize the error detection table
+        init_error_detection_table()
+
+        # Run batch checks
+        run_l2 = run_level2 == 'true'
+        stats = batch_run_checks(
+            use_case_filter=use_case if use_case else None,
+            limit=limit,
+            run_level2=run_l2
+        )
+
+        logger.info(f"Error detection complete: {stats.get('total_processed', 0)} traces checked")
+        logger.info(f"Errors found: {stats.get('total_errors', 0)}")
+        logger.info("=" * 60)
+
+        return RedirectResponse('/', status_code=303)
+    except Exception as e:
+        logger.error(f"RUN ERROR CHECKS EXCEPTION: {str(e)}")
+        return Div(
+            H3("Error Detection Failed", style="color: #ef4444; margin-bottom: 16px;"),
+            P(f"Exception: {str(e)}", style="color: #f87171;"),
+            A("Back to Dashboard", href="/", style="display: inline-block; margin-top: 16px; padding: 12px 24px; background: #3b82f6; color: white; border-radius: 8px; text-decoration: none;"),
+            style="padding: 24px;"
+        )
+
+
+@rt('/run-error-check/{element_id}')
+def post(element_id: str, run_level2: str = None):
+    """Run error detection on a single trace element"""
+    logger.info(f"Running error checks for element: {element_id}")
+
+    try:
+        run_l2 = run_level2 == 'true'
+        results = run_all_checks(element_id, run_level2=run_l2)
+        logger.info(f"Checks complete: {len(results)} checks run")
+
+        # Redirect back to trace page
+        # Get trace_id for this element
+        from analyzer import get_element_detail
+        element = get_element_detail(element_id)
+        if element:
+            return RedirectResponse(f"/trace/{element['trace_id']}", status_code=303)
+        return RedirectResponse('/', status_code=303)
+    except Exception as e:
+        logger.error(f"Error check failed for {element_id}: {str(e)}")
+        return RedirectResponse('/', status_code=303)
+
+
 @rt('/')
 def get():
     logger.info("Loading dashboard")
@@ -316,6 +477,9 @@ def get():
 
     # Get workspace stats from metadata for use case cards
     workspace_stats_by_use_case = get_workspace_stats_by_use_case()
+
+    # Get error detection stats
+    error_detection_stats = get_detection_error_stats()
 
     return Div(
         NavBar("dashboard"),
@@ -376,11 +540,16 @@ def get():
                 UseCaseDistributionChart(analysis.use_case_distribution),
                 style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-top: 24px; background: #1f2940; padding: 20px; border-radius: 12px; border: 1px solid #2d3748;"
             ),
-            # Two column layout for error and metadata
+            # Two column layout for error indicators and metadata
             Div(
                 ErrorDetectionPanel(analysis.error_detection_stats),
                 MetadataStatsPanel(analysis.metadata_stats),
                 style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-top: 24px;"
+            ),
+            # Error Detection Stats Panel (new L1/L2 checks)
+            Div(
+                ErrorDetectionStatsPanel(error_detection_stats),
+                style="margin-top: 24px;"
             ),
             # Use cases preview
             Div(
@@ -662,6 +831,9 @@ def get(trace_id: str, element_idx: int = 0):
     use_case_info = get_use_case_info(trace_detail.get('system_prompt_hash', ''))
     use_case_name = use_case_info.get('use_case_name') if use_case_info else None
 
+    # Get error check summary for current element
+    error_summary = get_error_summary_for_element(current_element.get('element_id', ''))
+
     # Calculate turn numbers
     turn_numbers = {}
     current_turn = 0
@@ -748,6 +920,8 @@ def get(trace_id: str, element_idx: int = 0):
                     ),
                     # Patient metadata panel (if available)
                     PatientMetadataPanel(current_element.get('patient_metadata')),
+                    # Error check results panel
+                    ErrorCheckResultsPanel(error_summary, element_id=current_element.get('element_id')),
                     # Trace metadata
                     Div(
                         H4("Trace Metadata", style="margin-bottom: 12px; color: #94a3b8; font-size: 0.85em;"),
@@ -846,7 +1020,7 @@ def get(model: str = None, use_case: str = None, error_type: str = None):
 
 
 @rt('/traces')
-def get(page: int = 1, limit: int = 50, model: str = None, use_case: str = None, has_errors: str = None, multi_element_only: str = None, with_metadata: str = None, multi_turn: str = None, workspace: str = None):
+def get(page: int = 1, limit: int = 50, model: str = None, use_case: str = None, has_errors: str = None, multi_element_only: str = None, with_metadata: str = None, multi_turn: str = None, workspace: str = None, error_status: str = None, error_check: str = None):
     logger.info(f"Loading all traces page {page} with filters")
 
     # Parse boolean filters
@@ -865,8 +1039,13 @@ def get(page: int = 1, limit: int = 50, model: str = None, use_case: str = None,
         multi_element_only=multi_element_bool,
         with_metadata=with_metadata_bool,
         multi_turn=multi_turn_bool,
-        workspace=workspace if workspace else None
+        workspace=workspace if workspace else None,
+        error_status=error_status if error_status else None,
+        error_check=error_check if error_check else None
     )
+
+    # Get available error checks for filter dropdown
+    available_error_checks = get_available_error_checks()
 
     # Get available filters
     filters = get_available_filters()
@@ -890,6 +1069,10 @@ def get(page: int = 1, limit: int = 50, model: str = None, use_case: str = None,
         query_parts.append(f"multi_turn={multi_turn}")
     if workspace:
         query_parts.append(f"workspace={workspace}")
+    if error_status:
+        query_parts.append(f"error_status={error_status}")
+    if error_check:
+        query_parts.append(f"error_check={error_check}")
     query_string = "&".join(query_parts)
     query_suffix = f"&{query_string}" if query_string else ""
 
@@ -905,7 +1088,7 @@ def get(page: int = 1, limit: int = 50, model: str = None, use_case: str = None,
             Div(
                 # Filter panel on the left
                 Div(
-                    FilterPanel(filters, current_model=model, current_use_case=use_case, has_errors=has_errors_bool, multi_element_only=multi_element_bool, with_metadata=with_metadata_bool, multi_turn=multi_turn_bool, current_workspace=workspace),
+                    FilterPanel(filters, current_model=model, current_use_case=use_case, has_errors=has_errors_bool, multi_element_only=multi_element_bool, with_metadata=with_metadata_bool, multi_turn=multi_turn_bool, current_workspace=workspace, current_error_status=error_status, current_error_check=error_check, available_error_checks=available_error_checks),
                     style="width: 280px; flex-shrink: 0;"
                 ),
                 # Traces list on the right

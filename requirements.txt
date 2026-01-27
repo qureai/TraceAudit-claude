@@ -1,2 +1,7 @@
 python-fasthtml
 uvicorn
+
+# Error detection dependencies
+portkey-ai
+python-dotenv
+pyyaml

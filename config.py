@@ -14,6 +14,9 @@ PROMPTS_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 PROCESSED_DIR.mkdir(exist_ok=True)
 
+# Error detection prompts
+ERROR_DETECTION_PROMPTS = PROMPTS_DIR / "error_detection.yaml"
+
 # Sampling settings
 TEST_SAMPLE_SIZE = 1000
 FULL_SAMPLE_SIZE = 50000

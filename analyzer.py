@@ -13,6 +13,7 @@ from metadata_loader import (
     get_trace_metadata, get_metadata_for_trace_id, get_available_workspaces,
     get_metadata_stats, metadata_table_exists
 )
+from error_detector import get_errors_for_element, get_error_stats
 
 logger = logging.getLogger(__name__)
 
@@ -606,7 +607,9 @@ def get_filtered_traces(
     multi_element_only: bool = False,
     with_metadata: bool = None,
     multi_turn: bool = None,
-    workspace: str = None
+    workspace: str = None,
+    error_status: str = None,
+    error_check: str = None
 ) -> tuple[list[dict], int]:
     """Get filtered list of traces with pagination."""
     conn = get_db_connection()
@@ -648,18 +651,48 @@ def get_filtered_traces(
         conditions.append('m.workspace_name = ?')
         params.append(workspace)
 
+    # Error detection filter - check if trace_errors table exists
+    has_error_table = False
+    try:
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trace_errors'")
+        has_error_table = cursor.fetchone() is not None
+    except:
+        pass
+
+    error_join_clause = ""
+    if has_error_table and (error_status or error_check):
+        error_join_clause = "LEFT JOIN trace_errors te ON t.element_id = te.element_id"
+
+        if error_status == 'has_errors':
+            conditions.append('te.has_error = 1')
+        elif error_status == 'no_errors':
+            # Traces that have been checked and have no errors
+            conditions.append('te.element_id IS NOT NULL')
+            conditions.append('t.element_id NOT IN (SELECT DISTINCT element_id FROM trace_errors WHERE has_error = 1)')
+        elif error_status == 'not_checked':
+            conditions.append('te.element_id IS NULL')
+
+        if error_check:
+            conditions.append('te.check_id = ?')
+            params.append(error_check)
+
     where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    # Combine join clauses
+    full_join_clause = join_clause
+    if error_join_clause:
+        full_join_clause = f"{join_clause} {error_join_clause}" if join_clause else error_join_clause
 
     # Get total count
     if multi_element_only:
         count_sql = f'''
-            SELECT COUNT(DISTINCT t.trace_id) FROM traces t {join_clause} {where_clause}
+            SELECT COUNT(DISTINCT t.trace_id) FROM traces t {full_join_clause} {where_clause}
             {'AND' if where_clause else 'WHERE'} t.trace_id IN (
                 SELECT trace_id FROM traces GROUP BY trace_id HAVING COUNT(*) > 1
             )
         '''
     else:
-        count_sql = f'SELECT COUNT(*) FROM traces t {join_clause} {where_clause}'
+        count_sql = f'SELECT COUNT(*) FROM traces t {full_join_clause} {where_clause}'
 
     cursor.execute(count_sql, params)
     total = cursor.fetchone()[0]
@@ -680,12 +713,13 @@ def get_filtered_traces(
         select_cols += ', m.workspace_name, m.patient_id, m.patient_name'
         if not join_clause:
             join_clause = "LEFT JOIN trace_metadata m ON t.element_id = m.element_id"
+            full_join_clause = f"{join_clause} {error_join_clause}" if error_join_clause else join_clause
 
     if multi_element_only:
         sql = f'''
             SELECT {select_cols}
             FROM traces t
-            {join_clause}
+            {full_join_clause}
             {where_clause}
             {'AND' if where_clause else 'WHERE'} t.trace_id IN (
                 SELECT trace_id FROM traces GROUP BY trace_id HAVING COUNT(*) > 1
@@ -697,7 +731,7 @@ def get_filtered_traces(
         sql = f'''
             SELECT {select_cols}
             FROM traces t
-            {join_clause}
+            {full_join_clause}
             {where_clause}
             ORDER BY t.parsed_timestamp DESC
             LIMIT ? OFFSET ?
@@ -742,14 +776,27 @@ def get_available_filters() -> dict:
     cursor.execute('SELECT DISTINCT model FROM traces ORDER BY model')
     models = [row[0] for row in cursor.fetchall()]
 
-    # Get unique use cases with counts
+    # Get unique use cases with counts and names from prompts table
     cursor.execute('''
-        SELECT system_prompt_hash, COUNT(*) as count
-        FROM traces
-        GROUP BY system_prompt_hash
+        SELECT t.system_prompt_hash, COUNT(*) as count, p.use_case_name
+        FROM traces t
+        LEFT JOIN prompts p ON t.system_prompt_hash = p.prompt_hash
+        GROUP BY t.system_prompt_hash
         ORDER BY count DESC
     ''')
-    use_cases = [{'hash': row[0], 'count': row[1]} for row in cursor.fetchall()]
+
+    # Separate matched (with name) and unmatched use cases
+    matched_use_cases = []
+    unmatched_use_cases = []
+    for row in cursor.fetchall():
+        use_case = {'hash': row[0], 'count': row[1], 'name': row[2]}
+        if row[2]:  # has a name
+            matched_use_cases.append(use_case)
+        else:
+            unmatched_use_cases.append(use_case)
+
+    # Put matched ones first, sorted by count, then unmatched
+    use_cases = matched_use_cases + unmatched_use_cases
 
     conn.close()
 
@@ -861,6 +908,67 @@ def get_workspace_stats_by_use_case() -> dict:
 
     conn.close()
     return result
+
+
+def get_error_summary_for_element(element_id: str) -> dict:
+    """
+    Get error check summary for a specific trace element.
+
+    Returns:
+        dict with total_checks, errors_found, error_details
+    """
+    errors = get_errors_for_element(element_id)
+
+    if not errors:
+        return {
+            'total_checks': 0,
+            'errors_found': 0,
+            'checked': False,
+            'error_details': []
+        }
+
+    errors_found = [e for e in errors if e['has_error']]
+
+    return {
+        'total_checks': len(errors),
+        'errors_found': len(errors_found),
+        'checked': True,
+        'error_details': errors
+    }
+
+
+def get_available_error_checks() -> list[dict]:
+    """Get list of unique error check IDs with their counts."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute('''
+            SELECT check_id, check_level, COUNT(*) as total, SUM(has_error) as errors
+            FROM trace_errors
+            GROUP BY check_id, check_level
+            ORDER BY errors DESC
+        ''')
+
+        results = []
+        for row in cursor.fetchall():
+            results.append({
+                'check_id': row[0],
+                'check_level': row[1],
+                'total': row[2],
+                'errors': row[3]
+            })
+        return results
+
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+
+
+def get_detection_error_stats() -> dict:
+    """Get error detection stats for dashboard display."""
+    return get_error_stats()
 
 
 if __name__ == "__main__":
