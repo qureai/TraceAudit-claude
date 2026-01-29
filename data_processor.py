@@ -53,6 +53,10 @@ class TraceInfo:
     is_multi_turn: bool
     user_disagreement_detected: bool
     potential_error_indicators: str
+    # Trace filtering metadata
+    total_elements_in_trace: int = 1  # How many elements existed for this trace_id
+    element_pattern: str = 'single'   # 'single', 'retry', 'progressive'
+    filtered_element_count: int = 0   # How many were filtered out
 
 
 def parse_timestamp(date_str: str) -> Optional[datetime]:
@@ -289,7 +293,10 @@ def init_database():
             metadata_keys TEXT,
             is_multi_turn INTEGER,
             user_disagreement_detected INTEGER,
-            potential_error_indicators TEXT
+            potential_error_indicators TEXT,
+            total_elements_in_trace INTEGER,
+            element_pattern TEXT,
+            filtered_element_count INTEGER
         )
     ''')
 
@@ -458,69 +465,73 @@ def update_prompts_with_use_cases(conn, use_case_mapping: dict):
     logger.info(f"Updated {updated} prompts with use case names")
 
 
-def is_progressive_build(elements: list) -> bool:
+def classify_and_select_element(elements: list) -> tuple[dict, str, int]:
     """
-    Detect if a group of elements represents a progressive conversation build.
+    Classify trace pattern and select the best element to keep.
 
-    Progressive build pattern:
-    - Message counts are non-decreasing when sorted by time (allows duplicates)
-    - Last element has more messages than first (conversation grew)
-    - Same conversation being built up (later elements contain earlier messages)
+    Patterns:
+    - 'single': Only one element exists
+    - 'retry': Multiple elements with same message count (retries/duplicates)
+    - 'progressive': Multiple elements with different message counts (conversation building)
 
-    Separate elements pattern:
-    - Message counts decrease at some point (e.g., 5, 5, 5 - retries with same content)
-    - Or all elements have same message count
-    - Different interactions with same trace_id
+    Selection logic:
+    - For 'retry': Keep the LATEST element (most recent attempt)
+    - For 'progressive': Keep element with MAX messages (most complete state)
+
+    Returns: (element_to_keep, pattern_type, filtered_count)
     """
-    if len(elements) <= 1:
-        return False
+    if len(elements) == 1:
+        return elements[0], 'single', 0
 
-    # Sort by parsed timestamp
+    # Sort by timestamp
     sorted_elements = sorted(elements, key=lambda x: x['parsed_timestamp'] or '')
-
-    # Get message counts in time order
     msg_counts = [e['num_messages'] for e in sorted_elements]
 
-    # Check if non-decreasing (allows duplicates but no decreases)
-    is_non_decreasing = all(msg_counts[i] <= msg_counts[i+1] for i in range(len(msg_counts)-1))
+    if len(set(msg_counts)) == 1:
+        # RETRY pattern: all elements have same message count
+        # Keep the latest element (most recent attempt)
+        return sorted_elements[-1], 'retry', len(elements) - 1
+    else:
+        # PROGRESSIVE pattern: different message counts
+        # Keep the element with MAX messages (most complete state)
+        # If multiple have max, pick the latest among them
+        max_msgs = max(msg_counts)
+        max_elements = [e for e in sorted_elements if e['num_messages'] == max_msgs]
+        return max_elements[-1], 'progressive', len(elements) - 1
 
-    # Also require that the conversation actually grew (last > first)
-    conversation_grew = msg_counts[-1] > msg_counts[0]
 
-    return is_non_decreasing and conversation_grew
-
-
-def filter_progressive_builds(trace_groups: dict) -> list:
+def filter_and_annotate_traces(trace_groups: dict) -> list:
     """
-    Filter trace groups to handle progressive builds.
+    Filter trace groups to keep one element per trace_id and annotate with metadata.
 
-    For progressive builds: keep only the latest element (has all messages)
-    For separate elements: keep all elements
+    For all multi-element traces:
+    - Classifies the pattern (single, retry, progressive)
+    - Selects the best element to keep
+    - Annotates with filtering metadata
 
-    Returns list of (trace_info, raw_trace) tuples to insert.
+    Returns list of elements to insert with metadata added to trace_info.
     """
     filtered = []
-    progressive_count = 0
-    elements_removed = 0
+    pattern_stats = {'single': 0, 'retry': 0, 'progressive': 0}
+    total_filtered_out = 0
 
     for trace_id, elements in trace_groups.items():
-        if len(elements) == 1:
-            # Single element, keep it
-            filtered.append(elements[0])
-        elif is_progressive_build(elements):
-            # Progressive build - keep only the latest (most messages)
-            progressive_count += 1
-            elements_removed += len(elements) - 1
-            # Sort by timestamp and keep the last one
-            sorted_elements = sorted(elements, key=lambda x: x['parsed_timestamp'] or '')
-            filtered.append(sorted_elements[-1])
-        else:
-            # Separate elements - keep all
-            filtered.extend(elements)
+        best_element, pattern, filtered_count = classify_and_select_element(elements)
 
-    if progressive_count > 0:
-        logger.info(f"Detected {progressive_count} progressive conversation builds")
-        logger.info(f"Removed {elements_removed} intermediate elements (keeping latest with full conversation)")
+        # Add metadata to the trace_info
+        best_element['trace_info'].total_elements_in_trace = len(elements)
+        best_element['trace_info'].element_pattern = pattern
+        best_element['trace_info'].filtered_element_count = filtered_count
+
+        filtered.append(best_element)
+        pattern_stats[pattern] += 1
+        total_filtered_out += filtered_count
+
+    # Log statistics
+    logger.info(f"Trace pattern distribution: single={pattern_stats['single']}, "
+                f"retry={pattern_stats['retry']}, progressive={pattern_stats['progressive']}")
+    logger.info(f"Total elements filtered out: {total_filtered_out} "
+                f"(keeping {len(filtered)} from {sum(len(e) for e in trace_groups.values())} total)")
 
     return filtered
 
@@ -586,10 +597,10 @@ def process_jsonl(sample_size: int = 1000) -> dict:
 
     logger.info(f"Read {read_count:,} elements across {len(trace_groups):,} unique trace_ids")
 
-    # Phase 2: Filter progressive builds
+    # Phase 2: Filter and annotate traces
     logger.info("-" * 60)
-    logger.info("Phase 2: Detecting and filtering progressive conversation builds...")
-    filtered_elements = filter_progressive_builds(trace_groups)
+    logger.info("Phase 2: Classifying patterns and selecting best elements...")
+    filtered_elements = filter_and_annotate_traces(trace_groups)
     logger.info(f"After filtering: {len(filtered_elements):,} elements to insert")
 
     # Phase 3: Insert filtered traces into database
@@ -618,7 +629,7 @@ def process_jsonl(sample_size: int = 1000) -> dict:
 
         # Insert trace info
         cursor.execute('''
-            INSERT OR REPLACE INTO traces VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO traces VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             trace_info.element_id, trace_info.trace_id,
             trace_info.created_at, trace_info.parsed_timestamp,
@@ -631,7 +642,10 @@ def process_jsonl(sample_size: int = 1000) -> dict:
             trace_info.metadata_keys,
             1 if trace_info.is_multi_turn else 0,
             1 if trace_info.user_disagreement_detected else 0,
-            trace_info.potential_error_indicators
+            trace_info.potential_error_indicators,
+            trace_info.total_elements_in_trace,
+            trace_info.element_pattern,
+            trace_info.filtered_element_count
         ))
 
         # Store raw trace

@@ -817,12 +817,20 @@ def batch_run_checks(use_case_filter: str = None, limit: int = None, run_level2:
 
     init_error_detection_table(conn)
 
-    # Build query to get traces with metadata
+    # Build query to get ONE element per trace_id (the most recent one)
+    # This ensures we only run error checks on the "selected" element, not all elements
     sql = '''
         SELECT t.element_id, t.system_prompt_hash, r.data
         FROM traces t
         JOIN raw_traces r ON t.element_id = r.element_id
         JOIN trace_metadata m ON t.element_id = m.element_id
+        WHERE t.element_id IN (
+            SELECT element_id FROM (
+                SELECT element_id, trace_id,
+                       ROW_NUMBER() OVER (PARTITION BY trace_id ORDER BY parsed_timestamp DESC) as rn
+                FROM traces
+            ) WHERE rn = 1
+        )
     '''
 
     params = []
@@ -840,7 +848,7 @@ def batch_run_checks(use_case_filter: str = None, limit: int = None, run_level2:
             return {'error': f'Unknown use case: {use_case_filter}'}
 
     if conditions:
-        sql += ' WHERE ' + ' AND '.join(conditions)
+        sql += ' AND ' + ' AND '.join(conditions)
 
     sql += ' ORDER BY t.parsed_timestamp DESC'
 

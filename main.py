@@ -20,7 +20,7 @@ from analyzer import (
 )
 from components import (
     StatCard, ModelDistributionChart, UseCaseDistributionChart, UseCaseCard, TraceListItem,
-    MessageBubble, ErrorDetectionPanel, MetadataStatsPanel, TokenCostPanel, NavBar,
+    MessageBubble, MergedAssistantBubble, ErrorDetectionPanel, MetadataStatsPanel, TokenCostPanel, NavBar,
     MultiElementStatsPanel, FilterPanel, ErrorFilterPanel, format_date, PatientMetadataPanel,
     ErrorCheckResultsPanel, ErrorDetectionStatsPanel, ErrorDetectionFilterPanel
 )
@@ -844,13 +844,103 @@ def get(trace_id: str, element_idx: int = 0):
         elif msg.get('role') == 'assistant':
             turn_numbers[idx] = current_turn
 
-    # Render messages
+    # Build a mapping of tool_call_id to tool response message
+    tool_responses = {}
+    for msg in messages:
+        if msg.get('role') == 'tool':
+            tool_call_id = msg.get('tool_call_id')
+            if tool_call_id:
+                tool_responses[tool_call_id] = msg
+
+    # Group consecutive assistant messages of the same turn together
+    # This handles cases where multiple tool calls are sent as separate messages
+    grouped_messages = []
+    first_system_seen = False
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        role = msg.get('role')
+
+        # Skip tool response messages - they're rendered with their tool calls
+        if role == 'tool':
+            i += 1
+            continue
+
+        if role == 'system':
+            is_first_system = not first_system_seen
+            first_system_seen = True
+            grouped_messages.append({
+                'messages': [msg],
+                'index': i,
+                'role': role,
+                'turn_number': turn_numbers.get(i),
+                'is_first_system': is_first_system
+            })
+            i += 1
+            continue
+
+        if role == 'assistant':
+            current_turn = turn_numbers.get(i)
+            # Collect all consecutive assistant messages with same turn number
+            assistant_group = [msg]
+            j = i + 1
+            while j < len(messages):
+                next_msg = messages[j]
+                next_role = next_msg.get('role')
+                if next_role == 'tool':
+                    j += 1
+                    continue
+                if next_role == 'assistant' and turn_numbers.get(j) == current_turn:
+                    assistant_group.append(next_msg)
+                    j += 1
+                else:
+                    break
+
+            grouped_messages.append({
+                'messages': assistant_group,
+                'index': i,
+                'role': role,
+                'turn_number': current_turn,
+                'is_first_system': False
+            })
+            # Skip to after the group (accounting for tool messages in between)
+            i = j
+            continue
+
+        # User or other messages
+        grouped_messages.append({
+            'messages': [msg],
+            'index': i,
+            'role': role,
+            'turn_number': turn_numbers.get(i),
+            'is_first_system': False
+        })
+        i += 1
+
+    # Render grouped messages
     rendered_messages = []
-    for idx, msg in enumerate(messages):
-        rendered_messages.append(
-            MessageBubble(msg, idx, model=model if msg.get('role') == 'assistant' else None,
-                         turn_number=turn_numbers.get(idx))
-        )
+    for group in grouped_messages:
+        if group['role'] == 'assistant' and len(group['messages']) > 1:
+            # Multiple assistant messages in same turn - render as merged
+            rendered_messages.append(
+                MergedAssistantBubble(group['messages'], group['index'], model=model,
+                                     turn_number=group['turn_number'], tool_responses=tool_responses)
+            )
+        else:
+            msg = group['messages'][0]
+            tool_call_responses = None
+            if group['role'] == 'assistant' and msg.get('tool_calls'):
+                tool_call_responses = {}
+                for tc in msg.get('tool_calls', []):
+                    tc_id = tc.get('id')
+                    if tc_id and tc_id in tool_responses:
+                        tool_call_responses[tc_id] = tool_responses[tc_id]
+
+            rendered_messages.append(
+                MessageBubble(msg, group['index'], model=model if group['role'] == 'assistant' else None,
+                             turn_number=group['turn_number'], is_first_system=group['is_first_system'],
+                             tool_responses=tool_call_responses)
+            )
 
     # Trace selector if multiple traces
     element_selector = None
@@ -949,6 +1039,19 @@ def get(trace_id: str, element_idx: int = 0):
                         } else {
                             content.style.display = 'none';
                             toggle.textContent = '▶';
+                        }
+                    }
+                }
+                function toggleToolCall(contentId, toggleId) {
+                    const content = document.getElementById(contentId);
+                    const toggle = document.getElementById(toggleId);
+                    if (content && toggle) {
+                        if (content.style.display === 'none') {
+                            content.style.display = 'block';
+                            toggle.textContent = ' ▼';
+                        } else {
+                            content.style.display = 'none';
+                            toggle.textContent = ' ▶';
                         }
                     }
                 }

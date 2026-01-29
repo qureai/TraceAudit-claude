@@ -294,11 +294,126 @@ def TraceListItem(trace: dict, show_use_case: bool = False):
     )
 
 
-def MessageBubble(msg: dict, index: int, model: str = None, turn_number: int = None):
-    """Render a message bubble with role-based styling."""
+def MergedAssistantBubble(messages: list, index: int, model: str = None, turn_number: int = None, tool_responses: dict = None):
+    """Render multiple assistant messages merged into one bubble.
+
+    This handles cases where tool calls are sent as separate assistant messages
+    but should be displayed together in one panel.
+
+    Layout: All text content first, then all tool calls/responses at the bottom.
+    """
+    tool_responses = tool_responses or {}
+    bg_color = '#1f2940'
+    border = '4px solid #10b981'
+    text_color = '#e2e8f0'
+
+    label = 'ASSISTANT'
+    if turn_number:
+        label = f"ASSISTANT - Turn {turn_number}"
+    if model:
+        label = f"{label} ({model.split('/')[-1]})"
+
+    # Collect all text content first
+    text_elements = []
+    # Collect all tool calls and responses
+    tool_elements = []
+
+    for msg_idx, msg in enumerate(messages):
+        content = msg.get('content', '')
+        tool_calls = msg.get('tool_calls', [])
+
+        # Collect text content
+        if content:
+            text_elements.append(
+                Div(format_content(content), style=f"color: {text_color}; line-height: 1.6; margin-bottom: 8px;")
+            )
+
+        # Collect tool calls with their responses
+        for tc_idx, tc in enumerate(tool_calls):
+            func = tc.get('function', {})
+            tool_name = func.get('name', 'unknown')
+            tool_call_id = tc.get('id', f'tc-{index}-{msg_idx}-{tc_idx}')
+            try:
+                args = json.loads(func.get('arguments', '{}'))
+                args_str = json.dumps(args, indent=2)
+            except:
+                args_str = func.get('arguments', '')
+
+            call_toggle_id = f"tool-call-toggle-{index}-{msg_idx}-{tc_idx}"
+            call_content_id = f"tool-call-content-{index}-{msg_idx}-{tc_idx}"
+
+            # Tool call element
+            tool_call_element = Div(
+                Div(
+                    Span("🔧", style="margin-right: 8px;"),
+                    Span(tool_name, style="font-weight: 600; color: #f59e0b;"),
+                    Span(" ▶", id=call_toggle_id, style="cursor: pointer; user-select: none; color: #6b7280; font-size: 0.8em; margin-left: 8px;"),
+                    style="cursor: pointer;",
+                    onclick=f"toggleToolCall('{call_content_id}', '{call_toggle_id}')"
+                ),
+                Div(
+                    Pre(args_str,
+                        style="white-space: pre-wrap; font-size: 0.8em; background: #0f0f1a; padding: 8px; border-radius: 4px; margin: 0; color: #94a3b8; max-height: 400px; overflow-y: auto;"),
+                    id=call_content_id,
+                    style="display: none; margin-top: 8px;"
+                ),
+                style="padding: 12px; background: #2d2d1f; border-radius: 6px;"
+            )
+
+            # Tool response element (if available)
+            tool_response_element = None
+            if tool_call_id in tool_responses:
+                response_msg = tool_responses[tool_call_id]
+                response_content = response_msg.get('content', '')
+                resp_toggle_id = f"tool-resp-toggle-{index}-{msg_idx}-{tc_idx}"
+                resp_content_id = f"tool-resp-content-{index}-{msg_idx}-{tc_idx}"
+
+                tool_response_element = Div(
+                    Div(
+                        Span("📤", style="margin-right: 8px;"),
+                        Span(f"{tool_name} response", style="font-weight: 600; color: #10b981; font-size: 0.9em;"),
+                        Span(" ▶", id=resp_toggle_id, style="cursor: pointer; user-select: none; color: #6b7280; font-size: 0.8em; margin-left: 8px;"),
+                        style="cursor: pointer;",
+                        onclick=f"toggleToolCall('{resp_content_id}', '{resp_toggle_id}')"
+                    ),
+                    Div(
+                        Pre(response_content,
+                            style="white-space: pre-wrap; font-size: 0.8em; background: #0f0f1a; padding: 8px; border-radius: 4px; margin: 0; color: #94a3b8; max-height: 400px; overflow-y: auto;"),
+                        id=resp_content_id,
+                        style="display: none; margin-top: 8px;"
+                    ),
+                    style="padding: 12px; background: #1f2d1f; border-radius: 6px; margin-top: 4px;"
+                )
+
+            # Group tool call and response together
+            tool_elements.append(
+                Div(
+                    tool_call_element,
+                    tool_response_element,
+                    style="margin-top: 8px; border: 1px solid #3d3d2f; border-radius: 8px; overflow: hidden;"
+                )
+            )
+
+    # Combine: all text first, then all tool calls at bottom
+    all_elements = text_elements + tool_elements
+
+    return Div(
+        Div(label, style="font-size: 0.75em; font-weight: 600; color: #94a3b8; text-transform: uppercase; margin-bottom: 8px;"),
+        *all_elements,
+        style=f"background: {bg_color}; border-left: {border}; padding: 16px; border-radius: 8px; margin: 12px 0;"
+    )
+
+
+def MessageBubble(msg: dict, index: int, model: str = None, turn_number: int = None, is_first_system: bool = True, tool_responses: dict = None):
+    """Render a message bubble with role-based styling.
+
+    Args:
+        tool_responses: Dict mapping tool_call_id to tool response message (for grouping tool calls with responses)
+    """
     role = msg.get('role', 'unknown')
     content = msg.get('content', '')
     tool_calls = msg.get('tool_calls', [])
+    tool_responses = tool_responses or {}
 
     # Role-based styling
     style_map = {
@@ -318,46 +433,108 @@ def MessageBubble(msg: dict, index: int, model: str = None, turn_number: int = N
 
     # Handle system prompt placeholder
     if role == 'system':
-        return Div(
-            Div(
-                Div(label, style="display: inline-block; font-size: 0.75em; font-weight: 600; color: #94a3b8; text-transform: uppercase; margin-right: 10px;"),
-                Span("▶", id=f"sys-toggle-{index}", style="cursor: pointer; user-select: none; color: #6b7280; font-size: 0.9em;"),
-                style="cursor: pointer;",
-                onclick=f"toggleSystemMsg('sys-content-{index}', 'sys-toggle-{index}')"
-            ),
-            Div(
-                Pre(content[:500] + "..." if len(content) > 500 else content,
-                    style="white-space: pre-wrap; font-size: 0.85em; margin: 0; color: #94a3b8;"),
-                Div("[System prompt replaced with placeholder - see right panel for full content]",
-                    style="margin-top: 8px; font-style: italic; color: #64748b; font-size: 0.8em;"),
-                id=f"sys-content-{index}",
-                style="display: none; margin-top: 8px;"
-            ),
-            style=f"background: {bg_color}; border-left: {border}; padding: 16px; border-radius: 8px; margin: 12px 0;"
-        )
+        if is_first_system:
+            # First system message - truncate and show placeholder
+            return Div(
+                Div(
+                    Div(label, style="display: inline-block; font-size: 0.75em; font-weight: 600; color: #94a3b8; text-transform: uppercase; margin-right: 10px;"),
+                    Span("▶", id=f"sys-toggle-{index}", style="cursor: pointer; user-select: none; color: #6b7280; font-size: 0.9em;"),
+                    style="cursor: pointer;",
+                    onclick=f"toggleSystemMsg('sys-content-{index}', 'sys-toggle-{index}')"
+                ),
+                Div(
+                    Pre(content[:500] + "..." if len(content) > 500 else content,
+                        style="white-space: pre-wrap; font-size: 0.85em; margin: 0; color: #94a3b8;"),
+                    Div("[System prompt is truncated - see right panel for full content]",
+                        style="margin-top: 8px; font-style: italic; color: #64748b; font-size: 0.8em;"),
+                    id=f"sys-content-{index}",
+                    style="display: none; margin-top: 8px;"
+                ),
+                style=f"background: {bg_color}; border-left: {border}; padding: 16px; border-radius: 8px; margin: 12px 0;"
+            )
+        else:
+            # Subsequent system messages - scrollable, not truncated
+            return Div(
+                Div(
+                    Div(label, style="display: inline-block; font-size: 0.75em; font-weight: 600; color: #94a3b8; text-transform: uppercase; margin-right: 10px;"),
+                    Span("▼", id=f"sys-toggle-{index}", style="cursor: pointer; user-select: none; color: #6b7280; font-size: 0.9em;"),
+                    style="cursor: pointer;",
+                    onclick=f"toggleSystemMsg('sys-content-{index}', 'sys-toggle-{index}')"
+                ),
+                Div(
+                    Pre(content,
+                        style="white-space: pre-wrap; font-size: 0.85em; margin: 0; color: #94a3b8; max-height: 300px; overflow-y: auto;"),
+                    id=f"sys-content-{index}",
+                    style="display: block; margin-top: 8px;"
+                ),
+                style=f"background: {bg_color}; border-left: {border}; padding: 16px; border-radius: 8px; margin: 12px 0;"
+            )
 
-    # Handle tool calls
+    # Handle tool calls - collapsible by default, with tool responses grouped together
     if tool_calls:
         tool_elements = []
-        for tc in tool_calls:
+        for tc_idx, tc in enumerate(tool_calls):
             func = tc.get('function', {})
             tool_name = func.get('name', 'unknown')
+            tool_call_id = tc.get('id', f'tc-{index}-{tc_idx}')
             try:
                 args = json.loads(func.get('arguments', '{}'))
                 args_str = json.dumps(args, indent=2)
             except:
                 args_str = func.get('arguments', '')
 
+            call_toggle_id = f"tool-call-toggle-{index}-{tc_idx}"
+            call_content_id = f"tool-call-content-{index}-{tc_idx}"
+
+            # Tool call element
+            tool_call_element = Div(
+                Div(
+                    Span("🔧", style="margin-right: 8px;"),
+                    Span(tool_name, style="font-weight: 600; color: #f59e0b;"),
+                    Span(" ▶", id=call_toggle_id, style="cursor: pointer; user-select: none; color: #6b7280; font-size: 0.8em; margin-left: 8px;"),
+                    style="cursor: pointer;",
+                    onclick=f"toggleToolCall('{call_content_id}', '{call_toggle_id}')"
+                ),
+                Div(
+                    Pre(args_str,
+                        style="white-space: pre-wrap; font-size: 0.8em; background: #0f0f1a; padding: 8px; border-radius: 4px; margin: 0; color: #94a3b8; max-height: 400px; overflow-y: auto;"),
+                    id=call_content_id,
+                    style="display: none; margin-top: 8px;"
+                ),
+                style="padding: 12px; background: #2d2d1f; border-radius: 6px;"
+            )
+
+            # Tool response element (if available)
+            tool_response_element = None
+            if tool_call_id in tool_responses:
+                response_msg = tool_responses[tool_call_id]
+                response_content = response_msg.get('content', '')
+                resp_toggle_id = f"tool-resp-toggle-{index}-{tc_idx}"
+                resp_content_id = f"tool-resp-content-{index}-{tc_idx}"
+
+                tool_response_element = Div(
+                    Div(
+                        Span("📤", style="margin-right: 8px;"),
+                        Span(f"{tool_name} response", style="font-weight: 600; color: #10b981; font-size: 0.9em;"),
+                        Span(" ▶", id=resp_toggle_id, style="cursor: pointer; user-select: none; color: #6b7280; font-size: 0.8em; margin-left: 8px;"),
+                        style="cursor: pointer;",
+                        onclick=f"toggleToolCall('{resp_content_id}', '{resp_toggle_id}')"
+                    ),
+                    Div(
+                        Pre(response_content,
+                            style="white-space: pre-wrap; font-size: 0.8em; background: #0f0f1a; padding: 8px; border-radius: 4px; margin: 0; color: #94a3b8; max-height: 400px; overflow-y: auto;"),
+                        id=resp_content_id,
+                        style="display: none; margin-top: 8px;"
+                    ),
+                    style="padding: 12px; background: #1f2d1f; border-radius: 6px; margin-top: 4px;"
+                )
+
+            # Group tool call and response together
             tool_elements.append(
                 Div(
-                    Div(
-                        Span("🔧", style="margin-right: 8px;"),
-                        Span(tool_name, style="font-weight: 600; color: #f59e0b;"),
-                        style="margin-bottom: 8px;"
-                    ),
-                    Pre(args_str[:300] + "..." if len(args_str) > 300 else args_str,
-                        style="white-space: pre-wrap; font-size: 0.8em; background: #0f0f1a; padding: 8px; border-radius: 4px; margin: 0; color: #94a3b8;"),
-                    style="margin-top: 8px; padding: 12px; background: #2d2d1f; border-radius: 6px;"
+                    tool_call_element,
+                    tool_response_element,
+                    style="margin-top: 8px; border: 1px solid #3d3d2f; border-radius: 8px; overflow: hidden;"
                 )
             )
 
@@ -368,12 +545,28 @@ def MessageBubble(msg: dict, index: int, model: str = None, turn_number: int = N
             style=f"background: {bg_color}; border-left: {border}; padding: 16px; border-radius: 8px; margin: 12px 0;"
         )
 
-    # Handle tool response
+    # Handle orphaned tool response (only shown if not grouped with tool call)
+    # Note: Most tool responses are now rendered with their tool calls in the assistant message
     if role == 'tool':
+        tool_name = msg.get('name', 'Tool')
+        toggle_id = f"tool-resp-toggle-{index}"
+        content_id = f"tool-resp-content-{index}"
+
         return Div(
-            Div("TOOL RESPONSE", style="font-size: 0.75em; font-weight: 600; color: #f59e0b; text-transform: uppercase; margin-bottom: 8px;"),
-            Pre(content[:500] + "..." if len(content) > 500 else content,
-                style="white-space: pre-wrap; font-size: 0.8em; margin: 0; color: #94a3b8; background: #0f0f1a; padding: 8px; border-radius: 4px;"),
+            Div(
+                Span("📤", style="margin-right: 8px;"),
+                Span(f"TOOL RESPONSE", style="font-size: 0.75em; font-weight: 600; color: #f59e0b; text-transform: uppercase;"),
+                Span(f" ({tool_name})", style="font-size: 0.75em; color: #94a3b8;") if tool_name != 'Tool' else None,
+                Span(" ▶", id=toggle_id, style="cursor: pointer; user-select: none; color: #6b7280; font-size: 0.8em; margin-left: 8px;"),
+                style="cursor: pointer;",
+                onclick=f"toggleToolCall('{content_id}', '{toggle_id}')"
+            ),
+            Div(
+                Pre(content,
+                    style="white-space: pre-wrap; font-size: 0.8em; margin: 0; color: #94a3b8; background: #0f0f1a; padding: 8px; border-radius: 4px; max-height: 400px; overflow-y: auto;"),
+                id=content_id,
+                style="display: none; margin-top: 8px;"
+            ),
             style=f"background: {bg_color}; border-left: {border}; padding: 16px; border-radius: 8px; margin: 12px 0;"
         )
 
